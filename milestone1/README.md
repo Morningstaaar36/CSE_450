@@ -9,6 +9,14 @@ renderer prefers the integrated GPU (and falls back to a software rasteriser
 if Vulkan is unavailable), the analysis cloud is downsampled to ≤ 50 000
 points, and every PyTorch op runs on CPU.
 
+> **Testing this milestone?** See **[TESTING.md](TESTING.md)** for the full
+> how-to-use / how-to-test guide, including scene-vs-object classification and
+> real-world data (real indoor scan, real 3DGS object, Stanford scans):
+> ```bash
+> python fetch_real_data.py        # download real scenes + objects into data/
+> python tests/test_pipeline.py    # full suite → "ALL PASS"
+> ```
+
 | Module | Responsibility |
 | --- | --- |
 | `loader.py` | Parse `.ply` (standard + 3DGS), aggressive voxel-grid + random downsampling, bbox / centroid / extent stats |
@@ -121,19 +129,20 @@ The app accepts any standard `.ply` file with `x, y, z` vertex properties.
 RGB (`red, green, blue` channels) or 3DGS-style spherical-harmonic colour
 (`f_dc_0..2`) are both consumed; missing colour data renders neutral grey.
 
-### Pre-vetted lightweight datasets
+### Pre-vetted lightweight datasets (auto-downloaded)
 
-All three below are ≤ 50 MB so they fit the iGPU/no-discrete-GPU constraint.
+`python fetch_real_data.py` pulls these real clouds into `data/` (stdlib only,
+no extra deps). Each targets a specific part of the pipeline:
 
-| Cloud | Type | Source |
+| Cloud | Type | Exercises |
 | --- | --- | --- |
-| Stanford Bunny (~36 k pts) | object | https://graphics.stanford.edu/data/3Dscanrep/bunny.tar.gz |
-| Stanford Armadillo (~173 k pts) | object | https://graphics.stanford.edu/data/3Dscanrep/armadillo.tar.gz |
-| Redwood Apartment (sample frame) | indoor | http://redwood-data.org/indoor_lidar_rgbd/download.html |
+| `indoor_real.ply` (Redwood living-room fragment) | **indoor scene** | classifier + "indoor aligns upright" (89° → 3.3°) |
+| `luigi_3dgs.ply` (HuggingFace `dylanebert/3dgs`) | **real 3DGS object** | loader SH-DC colour/opacity path; flat-object classification |
+| `buddha.ply` (Stanford Happy Buddha) | **obvious object** | "obvious objects get roughly aligned" |
+| `bunny.ply` (Stanford Bunny) | ambiguous object | honest `up_ambiguous` flagging |
+| `armadillo.ply` (Stanford Armadillo) | object (binary **big-endian**) | loader byte-order robustness |
 
-Conversion: the Stanford `.ply` files are already PLY; Redwood ships `.pcd`
-and needs a one-liner conversion (`open3d.io.read_point_cloud(...)` +
-`write_point_cloud(...)`).
+`data/big.ply` (250k-pt capture) ships with the repo.
 
 ### Pointing the app at a `.ply`
 
@@ -197,17 +206,25 @@ alignment, exercises Vulkan-vs-software paths in the renderer, and asserts
 the recovered up-axis lies within tolerance of world +Y.
 
 ```bash
+python fetch_real_data.py          # once, to pull the real clouds
 python tests/test_pipeline.py
 # == indoor.ply ==
-# loader: raw=10,900  kept=10,900  voxel=None  time=1.4 ms
-# alignment: mode=indoor  conf=0.95  up-axis after = 0.55°  time=72 ms
-# renderer: Vulkan on Intel(R) Iris(R) Xe Graphics (TGL GT2) (integrated)
-#           id=3.5ms  al=0.8ms  diff_pixels=43,690
-# ...
+# alignment: mode=indoor  conf=0.95  true-up err = 0.04°  flags=[]
+# == object.ply ==
+# alignment: mode=object  conf=0.82  true-up err = 0.44°  flags=['yaw_ambiguous']
+# == real-world data ==
+#   indoor_real.ply  mode=indoor conf=0.77  [scene] floor upright to 3.3°
+#   luigi_3dgs.ply   mode=object conf=0.56  [gs_object] 3DGS SH-DC colours OK
+#   buddha.ply       mode=object conf=0.90  [obvious] up recovered to ≤0.0° under tilt
+#   bunny.ply        mode=object conf=0.60  [ambiguous] correctly flagged up_ambiguous
+#   ...
 # ALL PASS
 ```
 
-The script exits non-zero on any assertion failure.
+The suite uses **non-circular** metrics (recovery of a known up direction,
+floor-tilt after alignment, stability under random tilts) and exits non-zero
+on any assertion failure. Real files are skipped gracefully if not downloaded.
+See **[TESTING.md](TESTING.md)** for the full breakdown.
 
 ---
 
@@ -264,6 +281,11 @@ Tick these against your own captures once the environment is up.
 * **Vulkan cleanup on Linux** can segfault at interpreter shutdown — a known
   issue with the `vulkan-python` cffi bindings. The app calls `os._exit(0)`
   on quit to sidestep it; no data is lost.
-* **Yaw ambiguity** on symmetric objects is flagged in
-  `result.ambiguity_flags` but not yet resolved (handled by the Milestone-2
-  ML module).
+* **Object up-axis is shape-based.** Elongated objects (long axis up) and
+  flat/disc objects (thin axis up) are aligned from geometry. Free-form
+  objects whose up is *semantic* (e.g. the Stanford Bunny) cannot be oriented
+  by geometry alone — these are flagged `up_ambiguous` with low confidence
+  rather than confidently mis-aligned, and are the target of the Milestone-2
+  ML up-axis predictor.
+* **Yaw ambiguity** on symmetric objects (e.g. a vase) is flagged
+  `yaw_ambiguous` but not yet resolved (handled by the Milestone-2 ML module).

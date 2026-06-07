@@ -104,8 +104,7 @@ class ContentTypeClassifier:
 
     The primary signal is **dominant-plane coverage** — what fraction of the
     cloud can be explained by a single best-fit plane.  This is rotation-
-    invariant (works even when the cloud is tilted off the world axes) and
-    discriminates the typical capture targets well:
+    invariant (works even when the cloud is tilted off the world axes):
 
         * Indoor scans: floors/walls/ceilings are big planar surfaces, so a
           good RANSAC plane typically covers ≥25 % of points.
@@ -113,9 +112,13 @@ class ContentTypeClassifier:
           rarely explains more than ~15 % of points (mostly the base disc
           or a single facet).
 
-    A small PCA-based size + flatness term is folded in as a backup signal
-    for the edge case where a single planar object dominates the cloud
-    (e.g. a single wall fragment captured in isolation).
+    Plane coverage **alone** is not enough: a flat-ish object (e.g. a 3DGS
+    figurine captured front-on) has one big planar face and would look like a
+    scene.  A real room is distinguished by a **second large plane roughly
+    orthogonal to the first** — a wall meeting the floor.  So we require either
+    a floor *plus* an orthogonal wall, or a single overwhelmingly dominant
+    floor, before declaring "indoor".  Two near-parallel planes (the front and
+    back faces of a flat object) do not qualify.
     """
 
     def __init__(
@@ -123,12 +126,16 @@ class ContentTypeClassifier:
         indoor_inlier_threshold: float = 0.22,   # plane coverage ratio
         ransac_iters: int = 180,
         plane_thresh_rel: float = 0.015,         # relative to cloud extent
-        flat_lambda_ratio: float = 0.20,         # backup: λ3/λ2 < this → flat
+        wall_min_ratio: float = 0.12,            # 2nd plane coverage to count as a wall
+        wall_angle_tol_deg: float = 35.0,        # wall must be 90°±tol to the floor
+        huge_floor_ratio: float = 0.45,          # a floor this dominant => scene alone
     ):
         self.indoor_inlier_threshold = indoor_inlier_threshold
         self.ransac_iters = ransac_iters
         self.plane_thresh_rel = plane_thresh_rel
-        self.flat_lambda_ratio = flat_lambda_ratio
+        self.wall_min_ratio = wall_min_ratio
+        self.wall_angle_tol_deg = wall_angle_tol_deg
+        self.huge_floor_ratio = huge_floor_ratio
 
     def __call__(self, points: np.ndarray) -> Tuple[str, float, Dict[str, float]]:
         """Returns (mode, confidence, diagnostics)."""
@@ -149,42 +156,57 @@ class ContentTypeClassifier:
         l1, l2, l3 = float(lam[0]), float(lam[1]), float(lam[2])
         flat_ratio = l3 / max(l2, 1e-12)                   # λ3/λ2 — flatness
 
-        # ---- Dominant-plane RANSAC ---------------------------------------
-        # Sub-sample for speed — RANSAC quality saturates well below 50 k.
-        if n > 8000:
-            idx = np.random.default_rng(0).choice(n, size=8000, replace=False)
-            sample = points[idx]
-        else:
-            sample = points
-        plane_normal, plane_point, _ = _ransac_plane(
-            sample,
-            iterations=self.ransac_iters,
-            inlier_thresh=self.plane_thresh_rel,
-        )
-        # Count inliers on the full (un-subsampled) cloud for an honest ratio.
+        # ---- Dominant-plane RANSAC (the floor candidate) -----------------
         extent = float((points.max(axis=0) - points.min(axis=0)).max())
         tol = max(self.plane_thresh_rel * extent, 1e-6)
-        d = np.abs((points - plane_point) @ plane_normal)
-        plane_inliers = int(np.sum(d < tol))
-        plane_ratio = plane_inliers / n
+
+        def _coverage(normal, point):
+            """Fraction of the FULL cloud within `tol` of a plane."""
+            return float(np.mean(np.abs((points - point) @ normal) < tol))
+
+        # Sub-sample for speed — RANSAC quality saturates well below 50 k.
+        rng = np.random.default_rng(0)
+        sample = points[rng.choice(n, 8000, replace=False)] if n > 8000 else points
+        plane_normal, plane_point, _ = _ransac_plane(
+            sample, iterations=self.ransac_iters, inlier_thresh=self.plane_thresh_rel,
+        )
+        plane_ratio = _coverage(plane_normal, plane_point)
+
+        # ---- Second plane on the residual (the wall candidate) -----------
+        # Remove the floor's inliers and look for another large plane.  An
+        # orthogonal one is a wall (→ scene); a parallel one is just the
+        # opposite face of a flat object (→ not a scene).
+        off = np.abs((points - plane_point) @ plane_normal) >= tol
+        wall_ratio, wall_angle = 0.0, 0.0
+        residual = points[off]
+        if residual.shape[0] > 200:
+            rs = (residual[np.random.default_rng(1).choice(residual.shape[0], 8000,
+                  replace=False)] if residual.shape[0] > 8000 else residual)
+            n2, p2, _ = _ransac_plane(
+                rs, iterations=self.ransac_iters, inlier_thresh=self.plane_thresh_rel)
+            wall_ratio = float(np.sum(np.abs((residual - p2) @ n2) < tol)) / n
+            wall_angle = float(np.degrees(np.arccos(
+                min(1.0, abs(float(np.dot(plane_normal, n2)))))))
+        orthogonal_wall = (wall_ratio >= self.wall_min_ratio and
+                           abs(wall_angle - 90.0) <= self.wall_angle_tol_deg)
 
         # ---- Decision ----------------------------------------------------
-        # Soft score in [0,1] favouring 'indoor':
-        #   primary  : plane coverage
-        #   backup   : extreme flatness in PCA frame
+        # Soft score in [0,1] favouring 'indoor'.  A dominant plane is
+        # necessary but not sufficient — it must be a floor+wall pair, or an
+        # overwhelmingly dominant floor, to count as a scene.
         score = 0.0
         if plane_ratio >= self.indoor_inlier_threshold:
-            # Saturate at 2× threshold so a single huge plane doesn't peg conf.
-            score = min(plane_ratio / (2 * self.indoor_inlier_threshold), 1.0)
-        elif flat_ratio < self.flat_lambda_ratio and plane_ratio > 0.10:
-            # Backup: very flat cloud with a moderately-supported plane.
-            score = 0.55
+            base = min(plane_ratio / (2 * self.indoor_inlier_threshold), 1.0)
+            if orthogonal_wall:
+                score = max(base, 0.70)              # floor + wall → scene
+            elif plane_ratio >= self.huge_floor_ratio:
+                score = base                          # huge floor alone → scene
+            else:
+                score = 0.35                          # one mid plane, no wall → flat object
 
         mode = "indoor" if score >= 0.5 else "object"
-        # Margin from the boundary determines confidence.
-        confidence = float(np.clip(0.5 + (score - 0.5), 0.10, 0.95)) \
-            if mode == "indoor" else \
-            float(np.clip(0.5 + (0.5 - score), 0.10, 0.95))
+        # Confidence = distance of the score from the 0.5 boundary, rescaled.
+        confidence = float(np.clip(0.10 + 1.7 * abs(score - 0.5), 0.10, 0.95))
 
         # [M2 HOOK] — A learnt classifier output (logit) would be blended
         # here with `score` once the Milestone-2 model is available.
@@ -193,7 +215,9 @@ class ContentTypeClassifier:
             "lambda1": l1, "lambda2": l2, "lambda3": l3,
             "flat_ratio": flat_ratio,
             "plane_inlier_ratio": float(plane_ratio),
-            "plane_inliers": float(plane_inliers),
+            "wall_inlier_ratio": float(wall_ratio),
+            "wall_angle_deg": float(wall_angle),
+            "orthogonal_wall": float(orthogonal_wall),
             "n_points": float(n),
             "extent": float(extent),
             "score_indoor": score,
@@ -387,21 +411,56 @@ class GeometryAxisEstimator:
     def _object_transform(self,
                           points: np.ndarray
                           ) -> Tuple[np.ndarray, float, List[str]]:
+        """
+        Estimate the up axis of an isolated object from its PCA shape.
+
+        Pure geometry can only orient an object when its shape *defines* an
+        up axis.  Two shape classes carry that signal:
+
+            * Prolate ("elongated"): one dominant long axis (a bottle, statue,
+              pillar, person).  The long axis is up.
+            * Oblate ("flat / disc"): one dominant thin axis (a plate, table,
+              coin, a vase whose base disc flattens the cloud).  The thin axis
+              is up.
+
+        For a triaxial / near-isotropic object (e.g. the Stanford Bunny) the
+        up direction is *semantic*, not geometric — no PCA axis recovers it.
+        We pick the best available axis but flag `up_ambiguous` with low
+        confidence rather than reporting a confident wrong answer.  Resolving
+        these is the job of the Milestone-2 ML predictor.
+        """
         pts_t = torch.from_numpy(points.astype(np.float32)).to(CPU)
         centred = pts_t - pts_t.mean(dim=0, keepdim=True)
 
         # PCA — covariance eigenvectors via torch.linalg on CPU.
         cov = (centred.T @ centred) / max(centred.shape[0] - 1, 1)
         eigvals, eigvecs = torch.linalg.eigh(cov.to(CPU))
-        # eigvecs[:, i] is the eigenvector for eigvals[i]; ascending order.
+        # eigvecs[:, i] is the eigenvector for eigvals[i]; ascending order,
+        # so column 0 is the smallest-variance axis and column 2 the largest.
         eigvals_np = eigvals.cpu().numpy().astype(np.float64)
         eigvecs_np = eigvecs.cpu().numpy().astype(np.float64)
+        l3, l2, l1 = eigvals_np[0], eigvals_np[1], eigvals_np[2]   # l1 ≥ l2 ≥ l3
+        v_small, v_large = eigvecs_np[:, 0], eigvecs_np[:, 2]
 
-        # Smallest-variance direction = candidate up axis.
-        up_candidate = eigvecs_np[:, 0]
+        # Relative eigen-gaps tell us which axis is the "odd one out".
+        gap_top = (l1 - l2) / max(l1, 1e-12)    # large gap → prolate (long axis up)
+        gap_bot = (l2 - l3) / max(l2, 1e-12)    # large gap → oblate  (thin axis up)
+
+        if gap_top >= gap_bot:
+            up_candidate = v_large              # elongated → long axis is up
+            strength = gap_top
+        else:
+            up_candidate = v_small              # flat/disc → thin axis is up
+            strength = gap_bot
+
+        # Ambiguity: a weak winning gap, or two gaps too close to call, means
+        # the shape does not pin an up axis (triaxial / isotropic blob).
+        margin = abs(gap_top - gap_bot)
+        up_ambiguous = (strength < 0.25) or (margin < 0.15)
 
         # Disambiguate up/down: project points onto candidate, pick the sign
-        # so the median of the projection is *negative* (more mass below up).
+        # so the median of the projection is *negative* (more mass below up —
+        # objects are usually bottom-heavy, resting on a base).
         centroid = points.mean(axis=0)
         proj = (points - centroid) @ up_candidate
         if float(np.median(proj)) > 0:
@@ -409,20 +468,32 @@ class GeometryAxisEstimator:
 
         R = _rotation_align_vectors(up_candidate.astype(np.float32), UP_AXIS_WORLD)
 
-        # Yaw ambiguity for symmetric objects → flag low confidence.
-        anisotropy = float((eigvals_np[2] - eigvals_np[1]) /
-                           max(eigvals_np[2], 1e-9))
         flags: List[str] = []
-        if anisotropy < 0.05:
+        if up_ambiguous:
+            flags.append("up_ambiguous")
+        # Yaw ambiguity: once up is fixed, the heading is set by the remaining
+        # two axes.  If their eigenvalues are nearly equal the object is
+        # rotationally symmetric about up (a bottle, vase) → heading undefined.
+        if gap_top >= gap_bot:
+            yaw_pair = (l2, l3)                 # up was l1; remaining are l2,l3
+        else:
+            yaw_pair = (l1, l2)                 # up was l3; remaining are l1,l2
+        yaw_anisotropy = (yaw_pair[0] - yaw_pair[1]) / max(yaw_pair[0], 1e-12)
+        if yaw_anisotropy < 0.05:
             flags.append("yaw_ambiguous")
-        confidence = float(np.clip(0.3 + 0.6 * anisotropy, 0.2, 0.9))
+
+        # Confidence tracks how clearly the shape defines an up axis; ambiguous
+        # objects are heavily discounted so the UI/fusion can distrust them.
+        confidence = float(np.clip(
+            0.25 + 0.7 * strength * (0.4 if up_ambiguous else 1.0), 0.15, 0.9))
 
         T = np.eye(4, dtype=np.float32)
         T[:3, :3] = R.astype(np.float32)
         T[:3, 3] = -R.astype(np.float32) @ centroid.astype(np.float32)
 
         # [M2 HOOK] — replace `up_candidate` with the ML-predicted up vector
-        # when its confidence exceeds the PCA anisotropy margin.
+        # when its confidence exceeds this geometric `strength` margin; this
+        # is exactly where the `up_ambiguous` cases get rescued.
 
         return T, confidence, flags
 
@@ -509,16 +580,21 @@ class AlignmentEngine:
         the auto-yaw is wrong but the auto-up is right.
         """
         R = transform[:3, :3].astype(np.float64)
+        t = transform[:3, 3].astype(np.float64)
         # Where does world up land if we applied R^{-1}? -> the cloud's up.
         # We want a rotation that maps that vector back to world up but
         # introduces no heading.
         cloud_up = R.T @ UP_AXIS_WORLD.astype(np.float64)
         R_up = _rotation_align_vectors(
             cloud_up.astype(np.float32), UP_AXIS_WORLD
-        )
+        ).astype(np.float64)
+        # The original translation re-centred the cloud: t = -R @ centroid, so
+        # centroid = -Rᵀ t.  Recompute the translation for the new rotation so
+        # the cloud stays centred at the origin instead of drifting off-screen.
+        centroid = -R.T @ t
         out = np.eye(4, dtype=np.float32)
-        out[:3, :3] = R_up
-        out[:3, 3] = transform[:3, 3]
+        out[:3, :3] = R_up.astype(np.float32)
+        out[:3, 3] = (-R_up @ centroid).astype(np.float32)
         return out
 
 

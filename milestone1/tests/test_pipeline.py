@@ -12,13 +12,20 @@ Checks:
     1. Loader can parse a synthetic .ply and downsample under the cap.
     2. Alignment engine returns a valid 4×4 matrix, correct class label,
        and a finite confidence on both indoor and object inputs.
-    3. After applying the transform, the cloud's smallest-PCA axis lines
-       up with the world up-axis (+Y) within tolerance.
+    3. After applying the transform, the cloud's *known* up-axis (the
+       ground-truth direction the synthetic generator tilted away from +Y)
+       lands back on world +Y within tolerance.  This is a genuine recovery
+       test — it does NOT measure the smallest-PCA axis, which the alignment
+       forces onto +Y by construction and so always "passes".
     4. Renderer.render() returns an (H,W,4) uint8 image — using Vulkan
        when available, the software fallback otherwise.
     5. The 4x4 transform is applied via the renderer's scene root (a
        transform change is reflected in the next render call, not requiring
        a re-upload of vertex data).
+    6. Real-data robustness (when the files are present): a large real
+       capture (data/big.ply) loads + downsamples + aligns + renders, and a
+       free-form real object (data/bunny.ply, the Stanford Bunny) is
+       correctly reported as up-ambiguous rather than confidently mis-aligned.
 
 The script prints PASS / FAIL with timings and exits non-zero on failure.
 """
@@ -35,7 +42,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
 from loader import load_point_cloud, DEFAULT_POINT_CAP
-from alignment import AlignmentEngine
+from alignment import AlignmentEngine, _ransac_plane
 from renderer import VulkanRenderer
 from tests.gen_synth_ply import main as gen_synth
 
@@ -50,13 +57,34 @@ def _ensure_synth():
         gen_synth(DATA_DIR)
 
 
-def _angle_to_up(points: np.ndarray) -> float:
-    """Angle (degrees) between the cloud's smallest-PCA axis and +Y."""
-    c = points - points.mean(axis=0)
-    cov = c.T @ c / max(c.shape[0] - 1, 1)
-    _, V = np.linalg.eigh(cov)
-    smallest = V[:, 0]
-    return float(np.degrees(np.arccos(min(1.0, abs(smallest[1])))))
+def _rx(deg: float) -> np.ndarray:
+    a = np.radians(deg); c, s = np.cos(a), np.sin(a)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+
+
+def _rz(deg: float) -> np.ndarray:
+    a = np.radians(deg); c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+
+# Ground-truth up direction for each synthetic cloud: the generator starts
+# with up = +Y and applies (Rx then Rz) — see tests/gen_synth_ply.py — so the
+# true up in the file is Rz @ Rx @ +Y.  Keep these in sync with the generator.
+TRUE_UP = {
+    "indoor.ply": _rz(18) @ _rx(25) @ np.array([0.0, 1.0, 0.0]),
+    "object.ply": _rz(35) @ _rx(20) @ np.array([0.0, 1.0, 0.0]),
+}
+
+
+def _true_up_error_deg(R: np.ndarray, up_true: np.ndarray) -> float:
+    """Angle (deg) between the aligned ground-truth up and world +Y.
+
+    Non-circular: `up_true` is the physical up baked into the cloud by the
+    generator, independent of any PCA the estimator runs.
+    """
+    up_after = R @ up_true
+    up_after = up_after / (np.linalg.norm(up_after) + 1e-12)
+    return float(np.degrees(np.arccos(min(1.0, abs(up_after[1])))))
 
 
 def _apply_transform(points: np.ndarray, T: np.ndarray) -> np.ndarray:
@@ -81,7 +109,7 @@ def check_loader(ply_path: str):
     return pc, dt
 
 
-def check_alignment(pc, expected_mode: str, axis_tol_deg: float):
+def check_alignment(pc, expected_mode: str, axis_tol_deg: float, up_true):
     eng = AlignmentEngine()
     t0 = time.perf_counter()
     res = eng.align(pc.positions)
@@ -98,10 +126,10 @@ def check_alignment(pc, expected_mode: str, axis_tol_deg: float):
         f"expected mode={expected_mode!r}, got {res.mode!r}"
     assert 0.0 <= res.confidence <= 1.0, f"bad confidence {res.confidence}"
 
-    aligned = _apply_transform(pc.positions, T)
-    ang = _angle_to_up(aligned)
+    # Genuine recovery check against the known physical up direction.
+    ang = _true_up_error_deg(R, up_true)
     assert ang <= axis_tol_deg, \
-        f"up-axis angle after alignment = {ang:.2f}° > tol {axis_tol_deg}°"
+        f"true up-axis error after alignment = {ang:.2f}° > tol {axis_tol_deg}°"
     return res, dt, ang
 
 
@@ -142,6 +170,101 @@ def check_renderer(pc, transform: np.ndarray):
     return info2, t1, t2, diff
 
 
+# Real-world test files and what each is meant to exercise.  Files are loaded
+# only when present (see fetch_real_data.py to download them); the suite still
+# passes on a fresh checkout with just the synthetic clouds.
+#
+#   role "scene"     — real indoor scan, must classify indoor & sit upright
+#   role "gs_object" — real 3DGS .ply, exercises the SH-DC colour/opacity path
+#                      and must NOT be misread as a scene (the flat-object trap)
+#   role "obvious"   — clearly-oriented object, geometry must recover its up
+#   role "ambiguous" — free-form object, up is semantic → must be flagged
+#   role "big"       — large capture, must downsample under the cap & render
+REAL_FILES = [
+    ("indoor_real.ply", "indoor", "scene"),       # Redwood living-room fragment
+    ("luigi_3dgs.ply",  "object", "gs_object"),   # real 3D Gaussian Splatting figurine
+    ("buddha.ply",      "object", "obvious"),      # Stanford Happy Buddha (tall)
+    ("bunny.ply",       "object", "ambiguous"),    # Stanford Bunny
+    ("armadillo.ply",   "object", "ambiguous"),    # Stanford Armadillo (binary big-endian)
+    ("big.ply",         "object", "big"),          # 250k-point capture
+]
+
+
+def _rand_tilt(seed: int) -> np.ndarray:
+    """A repeatable moderate rotation (≤~50° per axis) to tilt an object by."""
+    rng = np.random.default_rng(seed)
+    ang = rng.uniform(-50, 50, size=3)
+    return _rz(ang[2]) @ _rx(ang[0]) @ _rz(ang[1])
+
+
+def _floor_tilt_after_deg(points: np.ndarray, T: np.ndarray) -> float:
+    """Tilt (deg) of the dominant plane's normal from +Y after applying T.
+    For a scene the dominant plane is the floor, so this is the residual
+    upright error — a non-circular, physically-meaningful scene metric."""
+    aligned = _apply_transform(points, T).astype(np.float64)
+    n, p, _ = _ransac_plane(aligned, iterations=400, inlier_thresh=0.02)
+    if n[1] < 0:
+        n = -n
+    return float(np.degrees(np.arccos(min(1.0, abs(n[1])))))
+
+
+def check_real(ply_path: str, expected_mode: str, role: str):
+    """Load + classify + align a real file and run role-specific assertions.
+    Returns (pc, res, note) where note is a short human-readable result."""
+    pc, _ = check_loader(ply_path)
+    eng = AlignmentEngine()
+    res = eng.align(pc.positions)
+
+    R = res.transform[:3, :3]
+    assert np.allclose(R @ R.T, np.eye(3), atol=1e-3), "rotation not orthogonal"
+    assert abs(np.linalg.det(R) - 1.0) < 1e-3, "rotation determinant != 1"
+    assert res.mode == expected_mode, \
+        f"expected mode={expected_mode!r}, got {res.mode!r}"
+
+    note = ""
+    if role == "scene":
+        tilt = _floor_tilt_after_deg(pc.positions, res.transform)
+        assert tilt <= 10.0, f"scene floor not upright after align: {tilt:.1f}°"
+        note = f"floor upright to {tilt:.1f}°"
+    elif role == "gs_object":
+        assert pc.is_gaussian_splat, "3DGS file not detected as gaussian splat"
+        assert pc.colors.min() >= 0.0 and pc.colors.max() <= 1.0, \
+            "SH-DC colours out of [0,1]"
+        note = "3DGS SH-DC colours OK; not misclassified as scene"
+    elif role == "obvious":
+        # Tilt the (centred) object by a known rotation and require the
+        # estimator to bring its up axis back close to +Y.
+        P = pc.positions.astype(np.float64)
+        P = P - P.mean(axis=0)
+        up_true = np.array([0.0, 1.0, 0.0])
+        # The object's own up at rest is what the estimator calls up; verify
+        # that same physical axis is recovered after an arbitrary tilt.
+        rest_R = eng.align(P.astype(np.float32)).transform[:3, :3]
+        phys_up = rest_R.T @ up_true
+        worst = 0.0
+        for s in range(3):
+            Q = _rand_tilt(s)
+            r2 = eng.align((P @ Q.T).astype(np.float32))
+            rec = r2.transform[:3, :3] @ (Q @ phys_up)
+            rec = rec / (np.linalg.norm(rec) + 1e-12)
+            worst = max(worst, np.degrees(np.arccos(min(1.0, abs(rec[1])))))
+        assert worst <= 15.0, f"obvious object up unstable under tilt: {worst:.1f}°"
+        note = f"up recovered to ≤{worst:.1f}° under tilt"
+    elif role == "ambiguous":
+        assert "up_ambiguous" in res.ambiguity_flags, \
+            f"free-form object not flagged up_ambiguous: {res.ambiguity_flags}"
+        assert res.confidence < 0.75, \
+            f"ambiguous object over-confident: {res.confidence:.2f}"
+        note = "correctly flagged up_ambiguous"
+    elif role == "big":
+        assert pc.raw_point_count > DEFAULT_POINT_CAP, "did not exercise downsampling"
+        assert pc.n <= DEFAULT_POINT_CAP, "not capped"
+        _info, _, _, diff = check_renderer(pc, res.transform)
+        assert diff > 0, "scene-root transform produced identical pixels"
+        note = f"downsampled {pc.raw_point_count:,}→{pc.n:,}, renders"
+    return pc, res, note
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -170,9 +293,11 @@ def main() -> int:
             continue
 
         try:
-            result, dt_align, ang = check_alignment(pc, expected_mode, axis_tol)
+            result, dt_align, ang = check_alignment(
+                pc, expected_mode, axis_tol, TRUE_UP[name])
             print(f"alignment: mode={result.mode}  conf={result.confidence:.2f}  "
-                  f"up-axis after = {ang:.2f}°  time={dt_align*1000:.1f} ms")
+                  f"true-up err = {ang:.2f}°  flags={result.ambiguity_flags}  "
+                  f"time={dt_align*1000:.1f} ms")
         except AssertionError as exc:
             failures.append(f"{name} alignment: {exc}")
             print(f"FAIL alignment: {exc}")
@@ -199,6 +324,28 @@ def main() -> int:
             "render_ms_identity": t_id * 1000,
             "render_ms_aligned": t_al * 1000,
         }
+
+    # ---- real-data robustness (run only when the files are present) -------
+    print("\n== real-world data ==")
+    n_real = 0
+    for name, expected_mode, role in REAL_FILES:
+        ply = os.path.join(DATA_DIR, name)
+        if not os.path.isfile(ply):
+            print(f"  {name:18s} SKIP (not present — run fetch_real_data.py)")
+            continue
+        n_real += 1
+        try:
+            pc, res, note = check_real(ply, expected_mode, role)
+            print(f"  {name:18s} mode={res.mode:6s} conf={res.confidence:.2f}  "
+                  f"[{role}] {note}")
+            summary[name] = {"mode": res.mode, "confidence": res.confidence,
+                             "role": role, "flags": res.ambiguity_flags,
+                             "raw_points": pc.raw_point_count, "kept": pc.n}
+        except AssertionError as exc:
+            failures.append(f"{name} ({role}): {exc}")
+            print(f"  {name:18s} FAIL [{role}]: {exc}")
+    if n_real == 0:
+        print("  (no real files found — synthetic checks only)")
 
     print("\n== summary ==")
     print(json.dumps(summary, indent=2))
