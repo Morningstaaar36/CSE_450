@@ -18,7 +18,9 @@ with `[M2 HOOK]` comments so the integration points are obvious.
 
 from __future__ import annotations
 
+import json
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -178,6 +180,8 @@ class ContentTypeClassifier:
         # opposite face of a flat object (→ not a scene).
         off = np.abs((points - plane_point) @ plane_normal) >= tol
         wall_ratio, wall_angle = 0.0, 0.0
+        wall_normal = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        wall_point = plane_point.astype(np.float32)
         residual = points[off]
         if residual.shape[0] > 200:
             rs = (residual[np.random.default_rng(1).choice(residual.shape[0], 8000,
@@ -187,6 +191,8 @@ class ContentTypeClassifier:
             wall_ratio = float(np.sum(np.abs((residual - p2) @ n2) < tol)) / n
             wall_angle = float(np.degrees(np.arccos(
                 min(1.0, abs(float(np.dot(plane_normal, n2)))))))
+            wall_normal = n2.astype(np.float32)
+            wall_point = p2.astype(np.float32)
         orthogonal_wall = (wall_ratio >= self.wall_min_ratio and
                            abs(wall_angle - 90.0) <= self.wall_angle_tol_deg)
 
@@ -227,6 +233,9 @@ class ContentTypeClassifier:
             "plane_point_x": float(plane_point[0]),
             "plane_point_y": float(plane_point[1]),
             "plane_point_z": float(plane_point[2]),
+            "wall_normal_x": float(wall_normal[0]),
+            "wall_normal_y": float(wall_normal[1]),
+            "wall_normal_z": float(wall_normal[2]),
         }
         return mode, confidence, diagnostics
 
@@ -391,6 +400,39 @@ class GeometryAxisEstimator:
         R = _rotation_align_vectors(normal, UP_AXIS_WORLD)
 
         flags: List[str] = []
+
+        # --- Wall-based yaw refinement ---------------------------------------
+        # Fixing the floor normal to +Y leaves the heading (yaw about up) free,
+        # so two rooms with identical floors can still come out facing random
+        # directions.  When the classifier found an orthogonal *wall*, use its
+        # normal to also pin the heading: rotate about the new up axis so the
+        # wall faces world +X.  This is what turns "upright" into "upright AND
+        # squared-up", and it never disturbs the floor (a yaw about +Y leaves
+        # the floor normal at +Y), so the upright guarantee is preserved.
+        wall_yawed = False
+        if {"wall_normal_x", "wall_normal_y", "wall_normal_z"}.issubset(
+                diagnostics.keys()) and float(diagnostics.get("orthogonal_wall", 0.0)) >= 1.0:
+            wn = np.array([diagnostics["wall_normal_x"],
+                           diagnostics["wall_normal_y"],
+                           diagnostics["wall_normal_z"]], dtype=np.float64)
+            wn_up = R.astype(np.float64) @ wn          # wall normal in upright frame
+            horiz = np.array([wn_up[0], 0.0, wn_up[2]])  # drop the vertical part
+            if float(np.linalg.norm(horiz)) > 1e-3:
+                horiz = horiz / np.linalg.norm(horiz)
+                # Angle from world +X measured in the X–Z (ground) plane.
+                yaw = math.atan2(horiz[2], horiz[0])     # rotate by -yaw about +Y
+                c, s = math.cos(-yaw), math.sin(-yaw)
+                Ry = np.array([[c, 0.0, s],
+                               [0.0, 1.0, 0.0],
+                               [-s, 0.0, c]], dtype=np.float64)
+                R = (Ry @ R.astype(np.float64)).astype(np.float32)
+                wall_yawed = True
+        # `wall_yawed` is reported through diagnostics (not as an *ambiguity*
+        # flag); it records that the heading was squared to a wall.  The engine
+        # spreads this same `diagnostics` dict into the result, so the mutation
+        # propagates to the UI / changelog.
+        diagnostics["wall_yawed"] = float(wall_yawed)
+
         if inlier_ratio < 0.20:
             flags.append("weak_ground_plane")
         # Confidence rises with inlier coverage but is capped to leave room
@@ -599,11 +641,181 @@ class AlignmentEngine:
 
 
 # ---------------------------------------------------------------------------
+# AlignmentSession — preview / apply / reset + change history
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ChangeRecord:
+    """One entry in the alignment change log — *what* changed and *when*.
+
+    `before`/`after` are the 4×4 scene-root transforms on either side of the
+    action, so the whole edit history can be replayed or audited.
+    """
+    seq: int
+    action: str                              # auto_preview|apply|reset|rotate_90|flip|up_only|discard
+    timestamp: float                         # epoch seconds
+    before: List[List[float]]
+    after: List[List[float]]
+    note: str = ""
+    meta: Dict[str, object] = field(default_factory=dict)
+
+    def as_dict(self) -> dict:
+        return {
+            "seq": self.seq,
+            "action": self.action,
+            "timestamp": self.timestamp,
+            "iso_time": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                      time.localtime(self.timestamp)),
+            "before": self.before,
+            "after": self.after,
+            "note": self.note,
+            "meta": self.meta,
+        }
+
+
+class AlignmentSession:
+    """
+    Stateful wrapper around :class:`AlignmentEngine` implementing the M1 UX
+    contract: **preview → apply → reset**, plus manual nudges, with a full
+    **change history** ("store what was changed").
+
+    Two transforms are tracked:
+
+        * ``committed`` — the alignment the user has accepted (starts identity).
+        * ``preview``   — a *pending* alignment shown in the viewport but not yet
+                          accepted (``None`` when there's nothing pending).
+
+    ``current()`` returns whichever the renderer should display (preview if
+    one exists, else committed).  Every state change appends a
+    :class:`ChangeRecord`, so the session can answer "what did the user do, in
+    what order, and what was the matrix before/after each step?".
+    """
+
+    def __init__(self, engine: Optional[AlignmentEngine] = None):
+        self.engine = engine or AlignmentEngine()
+        self.committed: np.ndarray = np.eye(4, dtype=np.float32)
+        self.preview: Optional[np.ndarray] = None
+        self.last_result: Optional[AlignmentResult] = None
+        self.history: List[ChangeRecord] = []
+        self._seq = 0
+
+    # -- queries ----------------------------------------------------------
+    def current(self) -> np.ndarray:
+        """The transform the viewport should render right now."""
+        return (self.preview if self.preview is not None else self.committed).copy()
+
+    def has_preview(self) -> bool:
+        return self.preview is not None
+
+    def is_identity(self) -> bool:
+        return bool(np.allclose(self.current(), np.eye(4), atol=1e-6))
+
+    # -- internal ---------------------------------------------------------
+    def _log(self, action: str, before: np.ndarray, after: np.ndarray,
+             note: str = "", meta: Optional[dict] = None) -> ChangeRecord:
+        self._seq += 1
+        rec = ChangeRecord(
+            seq=self._seq, action=action, timestamp=time.time(),
+            before=np.asarray(before, dtype=float).tolist(),
+            after=np.asarray(after, dtype=float).tolist(),
+            note=note, meta=meta or {},
+        )
+        self.history.append(rec)
+        return rec
+
+    # -- preview / apply --------------------------------------------------
+    def preview_auto(self, points: np.ndarray) -> AlignmentResult:
+        """Compute an auto-alignment and stage it as a *preview* (not applied)."""
+        before = self.current()
+        res = self.engine.align(points)
+        self.preview = res.transform.astype(np.float32, copy=True)
+        self.last_result = res
+        self._log("auto_preview", before, self.preview,
+                  note=f"mode={res.mode} conf={res.confidence:.2f}",
+                  meta={"mode": res.mode, "confidence": res.confidence,
+                        "flags": list(res.ambiguity_flags),
+                        "wall_yawed": bool(res.diagnostics.get("wall_yawed", 0.0))})
+        return res
+
+    def apply(self) -> bool:
+        """Commit the pending preview.  No-op (returns False) if none staged."""
+        if self.preview is None:
+            return False
+        before = self.committed
+        self.committed = self.preview.astype(np.float32, copy=True)
+        self.preview = None
+        self._log("apply", before, self.committed, note="preview committed")
+        return True
+
+    def discard_preview(self) -> bool:
+        """Drop the pending preview without committing it."""
+        if self.preview is None:
+            return False
+        before = self.preview
+        self.preview = None
+        self._log("discard", before, self.committed, note="preview discarded")
+        return True
+
+    def reset(self) -> None:
+        """Drop everything back to identity (raw orientation)."""
+        before = self.current()
+        self.committed = np.eye(4, dtype=np.float32)
+        self.preview = None
+        self._log("reset", before, self.committed, note="back to raw orientation")
+
+    # -- manual nudges ----------------------------------------------------
+    def nudge(self, kind: str) -> np.ndarray:
+        """
+        Apply a manual tweak to whatever is current (preview if staged, else
+        committed).  ``kind`` is one of 'rotate_90', 'flip', 'up_only'.
+        Editing a preview keeps it a preview; editing the committed transform
+        edits it in place (still logged).
+        """
+        before = self.current()
+        if kind == "rotate_90":
+            after = AlignmentEngine.rotate_about_up(before, 90.0)
+        elif kind == "flip":
+            after = AlignmentEngine.flip_front_back(before)
+        elif kind == "up_only":
+            after = AlignmentEngine.keep_up_only(before)
+        else:
+            raise ValueError(f"unknown nudge {kind!r}")
+        if self.preview is not None:
+            self.preview = after.astype(np.float32, copy=True)
+        else:
+            self.committed = after.astype(np.float32, copy=True)
+        self._log(kind, before, after, note="manual tweak")
+        return self.current()
+
+    # -- persistence ------------------------------------------------------
+    def changelog(self) -> List[dict]:
+        return [r.as_dict() for r in self.history]
+
+    def state_dict(self, source: Optional[dict] = None) -> dict:
+        """A complete, serialisable snapshot: current transform + full history."""
+        payload = {
+            "committed_transform_4x4": self.committed.tolist(),
+            "has_pending_preview": self.has_preview(),
+            "n_changes": len(self.history),
+            "history": self.changelog(),
+        }
+        if self.last_result is not None:
+            payload["last_auto_align"] = self.last_result.as_dict()
+        if source:
+            payload["source"] = source
+        return payload
+
+    def save(self, path: str, source: Optional[dict] = None) -> None:
+        with open(path, "w") as f:
+            json.dump(self.state_dict(source), f, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import argparse, json
+    import argparse
     from loader import load_point_cloud
 
     ap = argparse.ArgumentParser(description="Baseline geometric alignment.")

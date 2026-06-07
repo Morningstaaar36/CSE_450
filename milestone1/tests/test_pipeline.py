@@ -23,9 +23,11 @@ Checks:
        transform change is reflected in the next render call, not requiring
        a re-upload of vertex data).
     6. Real-data robustness (when the files are present): a large real
-       capture (data/big.ply) loads + downsamples + aligns + renders, and a
-       free-form real object (data/bunny.ply, the Stanford Bunny) is
-       correctly reported as up-ambiguous rather than confidently mis-aligned.
+       capture (data/big.ply) loads + downsamples + aligns + renders, real
+       3DGS scenes in the antimatter15 .splat format (data/bonsai_3dgs.splat,
+       data/bicycle_3dgs.splat) load + downsample + render, and a free-form
+       real object (data/bunny.ply, the Stanford Bunny) is correctly reported
+       as up-ambiguous rather than confidently mis-aligned.
 
 The script prints PASS / FAIL with timings and exits non-zero on failure.
 """
@@ -177,16 +179,21 @@ def check_renderer(pc, transform: np.ndarray):
 #   role "scene"     — real indoor scan, must classify indoor & sit upright
 #   role "gs_object" — real 3DGS .ply, exercises the SH-DC colour/opacity path
 #                      and must NOT be misread as a scene (the flat-object trap)
+#   role "gs_scene"  — real 3DGS .splat 360° capture: exercises the .splat
+#                      loader at scale (downsample + render).  Mip-NeRF360
+#                      captures are object-centric (no dominant floor) → object
 #   role "obvious"   — clearly-oriented object, geometry must recover its up
 #   role "ambiguous" — free-form object, up is semantic → must be flagged
 #   role "big"       — large capture, must downsample under the cap & render
 REAL_FILES = [
-    ("indoor_real.ply", "indoor", "scene"),       # Redwood living-room fragment
-    ("luigi_3dgs.ply",  "object", "gs_object"),   # real 3D Gaussian Splatting figurine
-    ("buddha.ply",      "object", "obvious"),      # Stanford Happy Buddha (tall)
-    ("bunny.ply",       "object", "ambiguous"),    # Stanford Bunny
-    ("armadillo.ply",   "object", "ambiguous"),    # Stanford Armadillo (binary big-endian)
-    ("big.ply",         "object", "big"),          # 250k-point capture
+    ("indoor_real.ply",   "indoor", "scene"),      # Redwood living-room fragment
+    ("luigi_3dgs.ply",    "object", "gs_object"),  # real 3DGS figurine (.ply)
+    ("bonsai_3dgs.splat", "object", "gs_scene"),   # real 3DGS indoor 360° capture (.splat)
+    ("bicycle_3dgs.splat","object", "gs_scene"),   # real 3DGS outdoor 360° capture (.splat)
+    ("buddha.ply",        "object", "obvious"),     # Stanford Happy Buddha (tall)
+    ("bunny.ply",         "object", "ambiguous"),   # Stanford Bunny
+    ("armadillo.ply",     "object", "ambiguous"),   # Stanford Armadillo (binary big-endian)
+    ("big.ply",           "object", "big"),         # 250k-point capture
 ]
 
 
@@ -231,6 +238,18 @@ def check_real(ply_path: str, expected_mode: str, role: str):
         assert pc.colors.min() >= 0.0 and pc.colors.max() <= 1.0, \
             "SH-DC colours out of [0,1]"
         note = "3DGS SH-DC colours OK; not misclassified as scene"
+    elif role == "gs_scene":
+        # Real 3DGS .splat captures: exercise the .splat loader at scale plus
+        # the scene-root render.  Object-centric 360° scenes carry no dominant
+        # floor, so they correctly come back as 'object' (asserted up top).
+        assert pc.is_gaussian_splat, "3DGS .splat not detected as gaussian splat"
+        assert pc.colors.min() >= 0.0 and pc.colors.max() <= 1.0, \
+            "splat colours out of [0,1]"
+        assert pc.raw_point_count > DEFAULT_POINT_CAP, "did not exercise downsampling"
+        assert pc.n <= DEFAULT_POINT_CAP, "not capped"
+        _info, _, _, diff = check_renderer(pc, res.transform)
+        assert diff > 0, "scene-root transform produced identical pixels"
+        note = f"3DGS .splat {pc.raw_point_count:,}→{pc.n:,}, renders"
     elif role == "obvious":
         # Tilt the (centred) object by a known rotation and require the
         # estimator to bring its up axis back close to +Y.

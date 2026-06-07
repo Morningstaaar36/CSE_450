@@ -19,12 +19,15 @@ points, and every PyTorch op runs on CPU.
 
 | Module | Responsibility |
 | --- | --- |
-| `loader.py` | Parse `.ply` (standard + 3DGS), aggressive voxel-grid + random downsampling, bbox / centroid / extent stats |
+| `loader.py` | Parse `.ply` (standard + 3DGS SH-DC) **and `.splat`** (antimatter15 32-byte Gaussians), aggressive voxel-grid + random downsampling, bbox / centroid / extent stats |
 | `alignment.py` | `OutlierCleaner`, `ContentTypeClassifier`, `GeometryAxisEstimator` → `(4×4 transform, confidence, mode, ambiguity flags)` on CPU |
 | `renderer.py` | Offscreen Vulkan point renderer (`VK_PRIMITIVE_TOPOLOGY_POINT_LIST`), iGPU-preferred device pick, scene-root transform applied per frame, software fallback |
 | `app.py` | PyQt5 single-window app: viewport, axis gizmo, Auto Align / Align Up Only / Rotate 90° / Flip Front-Back / Save Alignment |
+| `visualize_pipeline.py` | Render every pipeline stage to a report-ready contact sheet per cloud (`visualizations/`) |
 | `shaders/*` | GLSL sources + compiled SPIR-V (`points.vert.spv`, `points.frag.spv`) |
-| `tests/` | Synthetic `.ply` generator + end-to-end pipeline check |
+| `tests/test_pipeline.py` | End-to-end pipeline check on synthetic + real clouds |
+| `tests/test_cases.py` | Many-case classifier / alignment decision-matrix check (+ `--viz`) |
+| `environment.yml` / `requirements.txt` | Reproducible CPU-only conda env / pip fallback |
 
 ---
 
@@ -32,34 +35,42 @@ points, and every PyTorch op runs on CPU.
 
 The project targets **Python 3.10–3.13** and a **CPU-only** PyTorch build.
 
-### Conda (recommended)
+### Conda (recommended) — one command
+
+The pinned, reproducible env lives in [`environment.yml`](environment.yml)
+(CPU-only PyTorch via the `cpuonly` package — never a CUDA build):
 
 ```bash
-# 1. create the env
-conda create -n m1-aligner python=3.11 -y
+conda env create -f environment.yml
 conda activate m1-aligner
-
-# 2. CPU-only PyTorch (no CUDA wheels — see hardware constraint)
-conda install -c pytorch pytorch=2.* cpuonly -y
-
-# 3. numerical / loading deps from conda-forge
-conda install -c conda-forge numpy scipy scikit-learn plyfile -y
-
-# 4. GUI + Vulkan Python bindings (pip — these aren't on conda-forge yet)
-pip install PyQt5 vulkan PyOpenGL
 ```
 
-### One-liner pip alternative
+This installs everything the engine, GUI, tests, **and** the visualization
+tooling need: numpy / scipy / scikit-learn / plyfile, CPU PyTorch, PyQt5 +
+vulkan, and matplotlib / imageio / pillow / pyyaml.
 
-If conda isn't available:
+### pip alternative
+
+If conda isn't available, [`requirements.txt`](requirements.txt) pulls the same
+stack (CPU torch from the PyTorch extra index):
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip
-pip install numpy scipy scikit-learn plyfile \
-            torch --index-url https://download.pytorch.org/whl/cpu \
-            PyQt5 vulkan PyOpenGL
+pip install -r requirements.txt
 ```
+
+<details><summary>Manual conda install (if you prefer explicit steps)</summary>
+
+```bash
+conda create -n m1-aligner python=3.11 -y
+conda activate m1-aligner
+conda install -c pytorch pytorch=2.* cpuonly -y
+conda install -c conda-forge numpy scipy scikit-learn plyfile \
+                             matplotlib imageio pillow pyyaml -y
+pip install PyQt5 vulkan PyOpenGL
+```
+</details>
 
 ### Sanity check
 
@@ -125,9 +136,14 @@ its NumPy software rasteriser. The rest of the app stays fully functional.
 
 ## 3. Dataset Handling
 
-The app accepts any standard `.ply` file with `x, y, z` vertex properties.
-RGB (`red, green, blue` channels) or 3DGS-style spherical-harmonic colour
-(`f_dc_0..2`) are both consumed; missing colour data renders neutral grey.
+The app accepts:
+
+* standard `.ply` with `x, y, z` (+ optional `red/green/blue`),
+* 3DGS `.ply` with spherical-harmonic colour (`f_dc_0..2`, `opacity`),
+* **3DGS `.splat`** files (antimatter15 32-byte Gaussians — the format most
+  web 3DGS viewers export).
+
+Missing colour data renders neutral grey.
 
 ### Pre-vetted lightweight datasets (auto-downloaded)
 
@@ -137,12 +153,21 @@ no extra deps). Each targets a specific part of the pipeline:
 | Cloud | Type | Exercises |
 | --- | --- | --- |
 | `indoor_real.ply` (Redwood living-room fragment) | **indoor scene** | classifier + "indoor aligns upright" (89° → 3.3°) |
-| `luigi_3dgs.ply` (HuggingFace `dylanebert/3dgs`) | **real 3DGS object** | loader SH-DC colour/opacity path; flat-object classification |
+| `luigi_3dgs.ply` (HuggingFace `dylanebert/3dgs`) | **real 3DGS object** (`.ply`) | loader SH-DC colour/opacity path; flat-object classification |
+| `bonsai_3dgs.splat` (Mip-NeRF360 via `dylanebert/3dgs`) | **real 3DGS indoor scene** (`.splat`) | `.splat` loader at scale (272k → ≤50k), object-centric-scene classification |
+| `bicycle_3dgs.splat` (Mip-NeRF360 via `dylanebert/3dgs`) | **real 3DGS outdoor scene** (`.splat`) | `.splat` loader on a 568k-Gaussian outdoor capture |
 | `buddha.ply` (Stanford Happy Buddha) | **obvious object** | "obvious objects get roughly aligned" |
 | `bunny.ply` (Stanford Bunny) | ambiguous object | honest `up_ambiguous` flagging |
 | `armadillo.ply` (Stanford Armadillo) | object (binary **big-endian**) | loader byte-order robustness |
 
 `data/big.ply` (250k-pt capture) ships with the repo.
+
+> **Note on 3DGS 360° captures.** Mip-NeRF360 scenes (`bonsai`, `bicycle`) are
+> *object-centric* — the camera orbits a central subject, so there is no single
+> dominant floor plane. The classifier therefore (correctly) returns `object`
+> rather than hallucinating a room. The canonical "indoor → upright" demo is
+> the Redwood `indoor_real.ply`, which is a partial room scan with a real
+> floor + wall.
 
 ### Pointing the app at a `.ply`
 
@@ -228,7 +253,35 @@ See **[TESTING.md](TESTING.md)** for the full breakdown.
 
 ---
 
-## 6. Architecture notes
+## 6. Visualizing each pipeline stage
+
+Every Milestone-1 step can be *seen*, not just asserted. `visualize_pipeline.py`
+drives a cloud through the real submodules and the Vulkan renderer and writes a
+3×3 contact sheet per cloud to `visualizations/`:
+
+```bash
+python visualize_pipeline.py                 # the curated default set
+python visualize_pipeline.py data/bunny.ply  # one or more explicit files
+```
+
+Each sheet lays out:
+
+| col 1 | col 2 | col 3 |
+| --- | --- | --- |
+| 1 · raw cloud | 2 · downsampled analysis cloud | 3 · outliers removed (red ✕) |
+| 4 · classify (green floor, blue wall) | 5 · alignment **input** (tilted) | 6 · alignment **applied** (upright) |
+| 7 · manual Rotate 90° | 8 · manual Flip Front/Back | 9 · real renderer output + gizmo |
+
+The classifier/alignment **decision matrix** (scenes vs prolate / oblate /
+isotropic / flat-object) renders to `visualizations/case_matrix.png`:
+
+```bash
+python tests/test_cases.py --viz
+```
+
+---
+
+## 7. Architecture notes
 
 * **Scene-root transform, not splat baking.** The 4×4 matrix is uploaded to
   the vertex shader as a push constant and combined with the camera matrix
@@ -243,7 +296,7 @@ See **[TESTING.md](TESTING.md)** for the full breakdown.
 
 ---
 
-## 7. Success Criteria Checklist
+## 8. Success Criteria Checklist
 
 Tick these against your own captures once the environment is up.
 
@@ -274,10 +327,16 @@ Tick these against your own captures once the environment is up.
 
 ---
 
-## 8. Known limitations & follow-up
+## 9. Known limitations & follow-up
 
-* **PLY format only** for now (standard XYZ + RGB, or 3DGS SH-DC). Splat
-  ellipsoids (`scale_*`, `rot_*`) are parsed but not rendered yet.
+* **Point formats:** standard `.ply` (XYZ + RGB), 3DGS `.ply` (SH-DC colour),
+  and antimatter15 `.splat` are all loaded. Per-Gaussian ellipsoids
+  (`scale_*`, `rot_*`) are parsed/decoded but rendered as points, not splats,
+  for now.
+* **Very flat lone objects** (a bare plate/coin whose single face covers ≥45 %
+  of points) can still read as a scene via the dominant-floor path — geometry
+  alone cannot tell a floor from a plate. Real figurines (`luigi_3dgs`) and
+  relief panels stay `object` because their dominant face is < 45 %.
 * **Vulkan cleanup on Linux** can segfault at interpreter shutdown — a known
   issue with the `vulkan-python` cffi bindings. The app calls `os._exit(0)`
   on quit to sidestep it; no data is lost.

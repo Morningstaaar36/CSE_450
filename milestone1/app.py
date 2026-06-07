@@ -37,7 +37,8 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from loader import PointCloud, load_point_cloud, DEFAULT_POINT_CAP
-from alignment import AlignmentEngine, AlignmentResult, UP_AXIS_WORLD
+from alignment import (AlignmentEngine, AlignmentResult, AlignmentSession,
+                       UP_AXIS_WORLD)
 from renderer import VulkanRenderer
 
 
@@ -73,6 +74,7 @@ class Viewport(QtWidgets.QWidget):
         self._fps_t = time.time()
         self._fps_frames = 0
         self._fps_value = 0.0
+        self._preview_active = False             # draw a PREVIEW badge when True
 
         # Drive repaints from a timer so the viewport stays interactive
         # without blocking the GUI thread.
@@ -103,6 +105,28 @@ class Viewport(QtWidgets.QWidget):
 
     def fps(self) -> float:
         return self._fps_value
+
+    def set_preview_active(self, on: bool) -> None:
+        self._preview_active = bool(on)
+        self.request_redraw()
+
+    def probe_fps(self, frames: int = 60) -> float:
+        """Render `frames` back-to-back and return the measured FPS.
+
+        Used to quantify the load-time FPS drop ("no meaningful FPS drop after
+        load"): call it with an empty renderer for the baseline, and again
+        after `set_point_cloud` for the loaded figure.
+        """
+        r = self._renderer
+        try:
+            r.render()                           # warm up / prime pipelines
+            t0 = time.perf_counter()
+            for _ in range(max(1, frames)):
+                r.render()
+            dt = time.perf_counter() - t0
+            return float(frames / dt) if dt > 0 else 0.0
+        except Exception:
+            return 0.0
 
     def request_redraw(self) -> None:
         self._needs_redraw = True
@@ -241,6 +265,14 @@ class Viewport(QtWidgets.QWidget):
         painter.drawText(QtCore.QPoint(10, 16), line1)
         painter.drawText(QtCore.QPoint(10, 32), line2)
 
+        # PREVIEW badge — makes it unmistakable that the shown alignment is
+        # pending and has not been committed yet.
+        if self._preview_active:
+            badge = QtCore.QRect(self.width() // 2 - 70, 10, 140, 26)
+            painter.fillRect(badge, QtGui.QColor(190, 130, 20, 200))
+            painter.setPen(QtGui.QColor(20, 20, 20))
+            painter.drawText(badge, QtCore.Qt.AlignCenter, "PREVIEW — not applied")
+
 
 # ---------------------------------------------------------------------------
 # Main window
@@ -253,10 +285,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("3DGS Alignment — Milestone 1")
         self.resize(1200, 760)
 
-        self._engine = AlignmentEngine()
+        self._session = AlignmentSession()
         self._cloud: Optional[PointCloud] = None
-        self._last_alignment: Optional[AlignmentResult] = None
         self._loaded_path: Optional[str] = None
+        # FPS-drop tracking: baseline is the empty-scene framerate, measured
+        # once at startup; per-load FPS is probed after each cloud loads.
+        self._baseline_fps: float = 0.0
+        self._loaded_fps: float = 0.0
 
         # central layout: viewport | side panel
         central = QtWidgets.QWidget(self)
@@ -273,6 +308,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_menu()
         self._status = self.statusBar()
+
+        # Baseline FPS on the empty scene — the reference for the "no meaningful
+        # FPS drop after load" criterion.  Probed once, before any cloud.
+        self._baseline_fps = self.viewport.probe_fps(frames=40)
         self._refresh_status()
 
     # ----- side panel --------------------------------------------------------
@@ -302,9 +341,13 @@ class MainWindow(QtWidgets.QMainWindow):
         sec2 = QtWidgets.QLabel("Alignment"); sec2.setObjectName("section")
         v.addWidget(sec2)
 
-        btn_auto = QtWidgets.QPushButton("Auto Align")
-        btn_auto.clicked.connect(self.action_auto_align)
-        v.addWidget(btn_auto)
+        btn_preview = QtWidgets.QPushButton("Preview Align")
+        btn_preview.clicked.connect(self.action_preview_align)
+        v.addWidget(btn_preview)
+
+        btn_apply = QtWidgets.QPushButton("Apply")
+        btn_apply.clicked.connect(self.action_apply)
+        v.addWidget(btn_apply)
 
         btn_up = QtWidgets.QPushButton("Align Up Only")
         btn_up.clicked.connect(self.action_align_up_only)
@@ -326,9 +369,13 @@ class MainWindow(QtWidgets.QMainWindow):
         sec3 = QtWidgets.QLabel("Persistence"); sec3.setObjectName("section")
         v.addWidget(sec3)
 
-        btn_save = QtWidgets.QPushButton("Save Alignment")
+        btn_save = QtWidgets.QPushButton("Save Alignment + History")
         btn_save.clicked.connect(self.action_save_alignment)
         v.addWidget(btn_save)
+
+        self.history_label = QtWidgets.QLabel("changes: 0")
+        self.history_label.setStyleSheet("color: #8a9;")
+        v.addWidget(self.history_label)
 
         v.addStretch(1)
 
@@ -371,64 +418,86 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._cloud = pc
         self._loaded_path = path
-        self._last_alignment = None
+        self._session = AlignmentSession()       # fresh history per cloud
         self.viewport.set_point_cloud(pc)
-        self.viewport.set_scene_transform(np.eye(4, dtype=np.float32))
+        self._sync_viewport()
+        # Probe the loaded-scene FPS so we can report the load-time drop.
+        self._loaded_fps = self.viewport.probe_fps(frames=40)
         self._refresh_cloud_label()
+        self._refresh_history()
         self._refresh_status(f"loaded {os.path.basename(path)} — "
-                             f"{pc.n:,} pts (raw {pc.raw_point_count:,})")
+                             f"{pc.n:,} pts (raw {pc.raw_point_count:,})  ·  "
+                             f"{self._fps_drop_note()}")
         self.diagnostics_label.setText("")
 
-    def action_auto_align(self) -> None:
+    # ----- preview / apply ---------------------------------------------------
+
+    def action_preview_align(self) -> None:
+        """Compute an auto-alignment and *stage* it (preview, not committed)."""
         if self._cloud is None:
             self._refresh_status("load a .ply first")
             return
         try:
-            result = self._engine.align(self._cloud.positions)
+            result = self._session.preview_auto(self._cloud.positions)
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(
-                self, "Alignment failed", f"{exc}"
-            )
+            QtWidgets.QMessageBox.critical(self, "Alignment failed", f"{exc}")
             return
-        self._last_alignment = result
-        self.viewport.set_scene_transform(result.transform)
+        self._sync_viewport()
         flags = f"  flags: {','.join(result.ambiguity_flags)}" if result.ambiguity_flags else ""
         self._refresh_status(
-            f"auto-align: mode={result.mode}  conf={result.confidence:.2f}{flags}"
+            f"PREVIEW: mode={result.mode}  conf={result.confidence:.2f}{flags}"
+            f"  — press Apply to commit"
         )
         self._refresh_diagnostics()
+        self._refresh_history()
+
+    # Back-compat alias: headless tests / CLI may still call action_auto_align.
+    action_auto_align = action_preview_align
+
+    def action_apply(self) -> None:
+        if not self._session.has_preview():
+            self._refresh_status("nothing to apply — Preview Align first")
+            return
+        self._session.apply()
+        self._sync_viewport()
+        self._refresh_status("applied — alignment committed")
+        self._refresh_history()
 
     def action_align_up_only(self) -> None:
         if self._cloud is None:
             self._refresh_status("load a .ply first")
             return
-        # Use the current transform if we have one, otherwise compute fresh.
-        if self._last_alignment is None:
-            self.action_auto_align()
-        current = self.viewport.scene_transform()
-        new = AlignmentEngine.keep_up_only(current)
-        self.viewport.set_scene_transform(new)
+        # If nothing staged or committed yet, compute a preview first.
+        if self._session.is_identity() and not self._session.has_preview():
+            self._session.preview_auto(self._cloud.positions)
+        self._session.nudge("up_only")
+        self._sync_viewport()
         self._refresh_status("kept up-axis, dropped yaw")
+        self._refresh_history()
 
     def action_rotate_90(self) -> None:
         if self._cloud is None:
             self._refresh_status("load a .ply first")
             return
-        new = AlignmentEngine.rotate_about_up(self.viewport.scene_transform(), 90.0)
-        self.viewport.set_scene_transform(new)
+        self._session.nudge("rotate_90")
+        self._sync_viewport()
         self._refresh_status("rotated 90° about up")
+        self._refresh_history()
 
     def action_flip_front_back(self) -> None:
         if self._cloud is None:
             self._refresh_status("load a .ply first")
             return
-        new = AlignmentEngine.flip_front_back(self.viewport.scene_transform())
-        self.viewport.set_scene_transform(new)
+        self._session.nudge("flip")
+        self._sync_viewport()
         self._refresh_status("flipped front/back")
+        self._refresh_history()
 
     def action_reset(self) -> None:
-        self.viewport.set_scene_transform(np.eye(4, dtype=np.float32))
+        self._session.reset()
+        self._sync_viewport()
         self._refresh_status("transform reset")
+        self._refresh_history()
 
     def action_save_alignment(self) -> None:
         if self._cloud is None or self._loaded_path is None:
@@ -440,26 +509,20 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if not path:
             return
-        T = self.viewport.scene_transform()
-        payload = {
+        source = {
             "source_ply": self._loaded_path,
             "raw_points": self._cloud.raw_point_count,
             "kept_points": self._cloud.n,
-            "transform_4x4": T.tolist(),
-            "is_auto_align": self._last_alignment is not None,
+            "baseline_fps": self._baseline_fps,
+            "loaded_fps": self._loaded_fps,
         }
-        if self._last_alignment is not None:
-            payload["auto_align"] = self._last_alignment.as_dict()
-            # We've potentially manually adjusted T since auto-align,
-            # so keep both: 'transform_4x4' is current; 'auto_align.transform'
-            # is what auto-align produced.
         try:
-            with open(path, "w") as f:
-                json.dump(payload, f, indent=2)
+            self._session.save(path, source=source)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Save failed", f"{exc}")
             return
-        self._refresh_status(f"saved alignment to {path}")
+        self._refresh_status(f"saved alignment + {len(self._session.history)} "
+                             f"change(s) to {path}")
 
     # ----- helpers -----------------------------------------------------------
 
@@ -477,17 +540,41 @@ class MainWindow(QtWidgets.QMainWindow):
             f"scale: {s.scale:.3f}"
         )
 
+    def _sync_viewport(self) -> None:
+        """Push the session's current transform + preview state to the viewport."""
+        self.viewport.set_scene_transform(self._session.current())
+        self.viewport.set_preview_active(self._session.has_preview())
+
+    def _fps_drop_note(self) -> str:
+        base = self._baseline_fps
+        loaded = self._loaded_fps
+        if base <= 0 or loaded <= 0:
+            return "fps drop: n/a"
+        drop = max(0.0, (base - loaded) / base) * 100.0
+        verdict = "OK" if loaded >= 30.0 else "LOW"
+        return (f"fps {loaded:.0f} vs {base:.0f} empty "
+                f"(drop {drop:.0f}%, ≥30 {verdict})")
+
+    def _refresh_history(self) -> None:
+        n = len(self._session.history)
+        last = self._session.history[-1].action if n else "—"
+        self.history_label.setText(f"changes: {n}   (last: {last})")
+
     def _refresh_diagnostics(self) -> None:
-        if self._last_alignment is None:
+        res = self._session.last_result
+        if res is None:
             self.diagnostics_label.setText("")
             return
-        d = self._last_alignment.diagnostics
-        bits = [f"mode: {self._last_alignment.mode}",
-                f"confidence: {self._last_alignment.confidence:.2f}"]
-        if self._last_alignment.ambiguity_flags:
-            bits.append("flags: " + ", ".join(self._last_alignment.ambiguity_flags))
+        d = res.diagnostics
+        bits = [f"mode: {res.mode}",
+                f"confidence: {res.confidence:.2f}"]
+        if res.ambiguity_flags:
+            bits.append("flags: " + ", ".join(res.ambiguity_flags))
         if "plane_inlier_ratio" in d:
             bits.append(f"plane inliers: {d['plane_inlier_ratio']*100:.0f}%")
+        if d.get("wall_yawed", 0.0):
+            bits.append("heading: squared to wall")
+        bits.append(self._fps_drop_note())
         self.diagnostics_label.setText("\n".join(bits))
 
     def _refresh_status(self, msg: Optional[str] = None) -> None:
@@ -521,9 +608,14 @@ def main() -> int:
             pc = load_point_cloud(sys.argv[1])
             w._cloud = pc
             w._loaded_path = sys.argv[1]
+            w._session = AlignmentSession()
             w.viewport.set_point_cloud(pc)
+            w._sync_viewport()
+            w._loaded_fps = w.viewport.probe_fps(frames=40)
             w._refresh_cloud_label()
-            w._refresh_status(f"loaded {os.path.basename(sys.argv[1])}")
+            w._refresh_history()
+            w._refresh_status(f"loaded {os.path.basename(sys.argv[1])}  ·  "
+                              f"{w._fps_drop_note()}")
         except Exception:
             traceback.print_exc()
 

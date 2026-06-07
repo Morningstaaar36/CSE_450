@@ -1,0 +1,49 @@
+# environment.yml — 3DGS Alignment Engine (Milestone 1)
+# ----------------------------------------------------------------------------
+# Reproducible CPU-only conda environment.  The target hardware has NO discrete
+# GPU, so PyTorch is pinned to the CPU build via the `cpuonly` package — do not
+# replace it with a CUDA build.
+#
+#   conda env create -f environment.yml
+#   conda activate m1-aligner
+#   python fetch_real_data.py        # pull real .ply / .splat clouds into data/
+#   python tests/test_pipeline.py    # full suite -> "ALL PASS"
+#
+# Version lower-bounds match what this milestone was verified against
+# (Python 3.13.5: numpy 2.4.4, scipy 1.15.3, scikit-learn 1.8.0, torch 2.9.1,
+#  plyfile 1.1.4, PyQt5 5.15.10, vulkan 1.3.275.1, matplotlib 3.10.0,
+#  imageio 2.37.0, pillow 11.1.0, pyyaml 6.0.2).  Ranges are kept loose so the
+# solver stays happy across platforms.
+# ----------------------------------------------------------------------------
+name: m1-aligner
+
+channels:
+  - pytorch          # CPU-only torch + the `cpuonly` meta-package
+  - conda-forge
+
+dependencies:
+  - python>=3.10,<3.14
+
+  # --- numerical / loading (conda-forge) ---
+  - numpy>=1.24
+  - scipy>=1.10
+  - scikit-learn>=1.3
+  - plyfile>=0.9
+
+  # --- visualization (conda-forge) ---
+  - matplotlib>=3.7
+  - imageio>=2.30
+  - pillow>=10.0
+  - pyyaml>=6.0
+
+  # --- PyTorch, CPU build (pytorch channel) ---
+  # `cpuonly` forces the non-CUDA build so this resolves on GPU-less laptops.
+  - pytorch>=2.1
+  - cpuonly
+
+  # --- GUI + Vulkan bindings (pip-only; not on conda-forge) ---
+  - pip
+  - pip:
+      - PyQt5>=5.15
+      - vulkan>=1.3
+      - PyOpenGL>=3.1

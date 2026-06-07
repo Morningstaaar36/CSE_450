@@ -1,0 +1,33 @@
+# requirements.txt — pip fallback for the 3DGS Alignment Engine (Milestone 1)
+# ----------------------------------------------------------------------------
+# CPU-only install (no discrete GPU on the target hardware).  The extra index
+# serves the CPU PyTorch wheels; everything else comes from PyPI.
+#
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install --upgrade pip
+#   pip install -r requirements.txt
+#
+# Prefer environment.yml (conda) when available — see that file for the
+# verified version matrix.
+# ----------------------------------------------------------------------------
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# numerical / loading
+numpy>=1.24
+scipy>=1.10
+scikit-learn>=1.3
+plyfile>=0.9
+
+# visualization
+matplotlib>=3.7
+imageio>=2.30
+pillow>=10.0
+PyYAML>=6.0
+
+# PyTorch (CPU build pulled from the extra index above)
+torch>=2.1
+
+# GUI + Vulkan bindings
+PyQt5>=5.15
+vulkan>=1.3
+PyOpenGL>=3.1

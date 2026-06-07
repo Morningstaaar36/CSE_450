@@ -14,6 +14,10 @@ Each file targets a specific part of the pipeline:
                      → scene-vs-object classifier + "indoor aligns upright"
     luigi_3dgs.ply   real 3D Gaussian Splatting figurine (f_dc/opacity/scale/rot)
                      → loader's 3DGS SH-DC colour path + flat-object classification
+    bonsai_3dgs.splat real 3DGS *indoor* 360° capture (antimatter15 .splat)
+                     → loader's .splat path + object-centric-scene classification
+    bicycle_3dgs.splat real 3DGS *outdoor* 360° capture (antimatter15 .splat)
+                     → loader's .splat path on a large outdoor scene
     buddha.ply       Stanford Happy Buddha (tall statue)
                      → "obvious objects get roughly aligned"
     bunny.ply        Stanford Bunny (free-form, up is semantic)
@@ -55,6 +59,18 @@ def fetch_plain(name: str, url: str) -> None:
         f.write(data)
 
 
+def fetch_splat(name: str, url: str) -> None:
+    """Download a binary antimatter15 `.splat` (32 bytes per Gaussian)."""
+    data = _get(url)
+    if len(data) == 0 or len(data) % 32 != 0:
+        raise ValueError(
+            f"{url} did not return a valid .splat "
+            f"(size {len(data)} is not a multiple of 32)"
+        )
+    with open(os.path.join(DATA, name), "wb") as f:
+        f.write(data)
+
+
 def fetch_gz(name: str, url: str) -> None:
     """Download a gzip-compressed .ply.gz and decompress to data/."""
     raw = gzip.decompress(_get(url))
@@ -83,6 +99,12 @@ TARGETS = [
     ("luigi_3dgs.ply", fetch_plain,
      ("https://huggingface.co/datasets/dylanebert/3dgs/resolve/main/"
       "luigi/luigi.ply",)),
+    ("bonsai_3dgs.splat", fetch_splat,
+     ("https://huggingface.co/datasets/dylanebert/3dgs/resolve/main/"
+      "bonsai/bonsai-7k-mini.splat",)),
+    ("bicycle_3dgs.splat", fetch_splat,
+     ("https://huggingface.co/datasets/dylanebert/3dgs/resolve/main/"
+      "bicycle/bicycle-7k-mini.splat",)),
     ("buddha.ply", fetch_from_tar,
      ("http://graphics.stanford.edu/pub/3Dscanrep/happy/happy_recon.tar.gz",
       "happy_vrip_res2.ply")),

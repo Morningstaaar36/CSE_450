@@ -5,7 +5,7 @@ loader.py
 Loader layer for the 3DGS alignment engine.
 
 Responsibilities (per Architecture Elements):
-    * parse point cloud / 3DGS  (.ply files)
+    * parse point cloud / 3DGS  (.ply files and antimatter15 .splat files)
     * create an analysis cloud   (aggressive downsampling, iGPU-friendly cap)
     * compute cloud statistics   (bbox, centroid, scale)
 
@@ -150,6 +150,57 @@ def _read_ply_vertex(path: str) -> Tuple[np.ndarray, np.ndarray, bool, dict]:
         extras["opacity"] = 1.0 / (1.0 + np.exp(-op))
 
     return pos, colors, bool(is_gs), extras
+
+
+# Byte layout of one Gaussian in the antimatter15 `.splat` format — the de-facto
+# interchange format produced by web 3DGS viewers (gsplat.tech, the HF
+# `dylanebert/3dgs` set, etc.).  Unlike the 3DGS `.ply`, colour here is already
+# evaluated sRGB (no spherical-harmonic decode needed) and opacity is a plain
+# 0–255 alpha rather than a logit.
+_SPLAT_RECORD = np.dtype([
+    ("pos",   "<f4", (3,)),   # bytes  0–11 : XYZ position
+    ("scale", "<f4", (3,)),   # bytes 12–23 : per-axis scale (unused at M1)
+    ("rgba",  "u1",  (4,)),   # bytes 24–27 : colour + alpha, 0–255
+    ("rot",   "u1",  (4,)),   # bytes 28–31 : packed quaternion (unused at M1)
+])
+assert _SPLAT_RECORD.itemsize == 32
+
+
+def _read_splat(path: str) -> Tuple[np.ndarray, np.ndarray, bool, dict]:
+    """
+    Read positions + colours from a binary `.splat` file (32 bytes / Gaussian).
+
+    Returns the same 4-tuple shape as :func:`_read_ply_vertex`
+    (positions, colours in [0,1], is_gs=True, extras-with-opacity).
+    Non-finite splats (occasionally emitted by exporters) are dropped so the
+    downstream stats / alignment never see NaNs.
+    """
+    raw = np.fromfile(path, dtype=np.uint8)
+    if raw.size == 0 or raw.size % _SPLAT_RECORD.itemsize != 0:
+        raise ValueError(
+            f"{path!r} is not a valid .splat file "
+            f"(size {raw.size} is not a multiple of 32)"
+        )
+    rec = raw.view(_SPLAT_RECORD)
+    pos = np.ascontiguousarray(rec["pos"], dtype=np.float32)
+    rgba = rec["rgba"].astype(np.float32) / 255.0
+    colors = np.ascontiguousarray(rgba[:, :3], dtype=np.float32)
+
+    finite = np.isfinite(pos).all(axis=1)
+    if not finite.all():
+        pos = pos[finite]
+        colors = colors[finite]
+        rgba = rgba[finite]
+
+    extras = {"opacity": np.ascontiguousarray(rgba[:, 3], dtype=np.float32)}
+    return pos, colors, True, extras
+
+
+def _read_points(path: str) -> Tuple[np.ndarray, np.ndarray, bool, dict]:
+    """Dispatch on file extension: `.splat` → splat reader, else PLY reader."""
+    if path.lower().endswith(".splat"):
+        return _read_splat(path)
+    return _read_ply_vertex(path)
 
 
 # ---------------------------------------------------------------------------
@@ -315,11 +366,12 @@ def load_point_cloud(
     seed: int = 0,
 ) -> PointCloud:
     """
-    Load a `.ply` file and return a downsampled analysis cloud.
+    Load a `.ply` or `.splat` file and return a downsampled analysis cloud.
 
     Parameters
     ----------
-    path      : path to a PLY (standard, or 3DGS-style with f_dc/opacity)
+    path      : path to a PLY (standard, or 3DGS-style with f_dc/opacity) or a
+                binary `.splat` file (antimatter15 32-byte Gaussian records)
     point_cap : hard upper bound on the returned point count
     seed      : RNG seed used only if random fallback fires
 
@@ -329,7 +381,7 @@ def load_point_cloud(
     if not os.path.isfile(path):
         raise FileNotFoundError(f"PLY file not found: {path}")
 
-    raw_pos, raw_col, is_gs, extras = _read_ply_vertex(path)
+    raw_pos, raw_col, is_gs, extras = _read_points(path)
     raw_n = int(raw_pos.shape[0])
     if raw_n == 0:
         raise ValueError(f"PLY file {path!r} contains zero vertices")
