@@ -28,6 +28,12 @@ import numpy as np
 import torch
 from sklearn.neighbors import NearestNeighbors
 
+try:
+    from ml_axis import MLAxisEstimator as _MLAxisEstimator
+    _ML_AVAILABLE = True
+except ImportError:
+    _ML_AVAILABLE = False
+
 CPU = torch.device("cpu")
 UP_AXIS_WORLD = np.array([0.0, 1.0, 0.0], dtype=np.float32)  # +Y is "up"
 FORWARD_WORLD = np.array([0.0, 0.0, -1.0], dtype=np.float32) # -Z is "forward"
@@ -93,6 +99,10 @@ class OutlierCleaner:
         sd = float(mean_d.std())
         thresh = mu + self.std_ratio * sd
         mask = mean_d <= thresh
+        kept = int(mask.sum())
+        print(f"[Outlier] k={self.k}  μ={mu:.5f}  σ={sd:.5f}  "
+              f"thresh={thresh:.5f}  kept={kept:,}/{points.shape[0]:,} "
+              f"({100*kept/points.shape[0]:.1f}% retained)")
         return points[mask], mask
 
 
@@ -195,6 +205,12 @@ class ContentTypeClassifier:
             wall_point = p2.astype(np.float32)
         orthogonal_wall = (wall_ratio >= self.wall_min_ratio and
                            abs(wall_angle - 90.0) <= self.wall_angle_tol_deg)
+        print(f"[Classifier] PCA  λ1={l1:.5f}  λ2={l2:.5f}  λ3={l3:.5f}  "
+              f"flat_ratio(λ3/λ2)={flat_ratio:.4f}")
+        print(f"[Classifier] floor plane  coverage={plane_ratio*100:.1f}%  "
+              f"(indoor threshold: {self.indoor_inlier_threshold*100:.0f}%)")
+        print(f"[Classifier] wall plane   coverage={wall_ratio*100:.1f}%  "
+              f"angle_to_floor={wall_angle:.1f}°  orthogonal={orthogonal_wall}")
 
         # ---- Decision ----------------------------------------------------
         # Soft score in [0,1] favouring 'indoor'.  A dominant plane is
@@ -213,6 +229,8 @@ class ContentTypeClassifier:
         mode = "indoor" if score >= 0.5 else "object"
         # Confidence = distance of the score from the 0.5 boundary, rescaled.
         confidence = float(np.clip(0.10 + 1.7 * abs(score - 0.5), 0.10, 0.95))
+
+        print(f"[Classifier] decision: {mode!r}  score_indoor={score:.3f}  conf={confidence:.3f}")
 
         # [M2 HOOK] — A learnt classifier output (logit) would be blended
         # here with `score` once the Milestone-2 model is available.
@@ -332,6 +350,9 @@ def _ransac_plane(points: np.ndarray,
         best_n = refined
         best_p = c.astype(np.float32)
 
+    print(f"[RANSAC]  {iterations} iters on {n:,} pts  "
+          f"best_inliers={best_count} ({100*best_count/max(n,1):.1f}%)  "
+          f"normal=[{best_n[0]:.4f}, {best_n[1]:.4f}, {best_n[2]:.4f}]")
     return best_n, best_p, best_count
 
 
@@ -355,6 +376,7 @@ class GeometryAxisEstimator:
         self.lower_shell_pct = lower_shell_pct
         self.ransac_iters = ransac_iters
         self.ransac_thresh = ransac_thresh
+        self.ml_estimator = None
 
     # -- indoor ------------------------------------------------------------
     def _indoor_transform(self,
@@ -438,14 +460,26 @@ class GeometryAxisEstimator:
         # Confidence rises with inlier coverage but is capped to leave room
         # for the classifier's confidence to influence the fused score.
         confidence = float(np.clip(0.4 + 1.5 * inlier_ratio, 0.25, 0.95))
+        src = "classifier_diag" if {"plane_normal_x"}.issubset(diagnostics.keys()) else "fresh_RANSAC"
+        print(f"[Estimator:indoor] plane_source={src}  "
+              f"normal=[{float(normal[0]):.4f}, {float(normal[1]):.4f}, {float(normal[2]):.4f}]  "
+              f"inlier_ratio={inlier_ratio:.3f}  wall_yawed={bool(diagnostics.get('wall_yawed', 0.0))}  "
+              f"conf={confidence:.3f}  flags={flags}")
 
         T = np.eye(4, dtype=np.float32)
         T[:3, :3] = R.astype(np.float32)
         T[:3, 3] = -R.astype(np.float32) @ centroid.astype(np.float32)
 
-        # [M2 HOOK] — The ML up-axis predictor's prior would be averaged in
-        # here (e.g. weighted Slerp between RANSAC normal and ML normal,
-        # weights ∝ each method's confidence).
+        # [M2 HOOK] — sanity-check only; RANSAC floor is trusted, ML adds a flag
+        if self.ml_estimator is not None:
+            ml_up, _ml_conf = self.ml_estimator.predict(points)
+            if ml_up is not None:
+                floor_unit = normal / (np.linalg.norm(normal) + 1e-9)
+                angle_deg = float(np.degrees(
+                    np.arccos(np.clip(np.dot(floor_unit, ml_up), -1.0, 1.0))))
+                if angle_deg > 30.0:
+                    flags.append("ml_floor_disagreement")
+                    print(f"[Estimator:indoor] ML up disagrees with RANSAC floor by {angle_deg:.1f}°")
 
         return T, confidence, flags
 
@@ -508,6 +542,40 @@ class GeometryAxisEstimator:
         if float(np.median(proj)) > 0:
             up_candidate = -up_candidate
 
+        # [M2 HOOK] — blend ML up-axis with PCA up_candidate before computing R.
+        # Gate: only activate when PCA itself is uncertain (up_ambiguous) AND
+        # ML has meaningful self-consistency. When PCA is confident, trust it —
+        # the ML is likely OOD and risks overriding a correct answer.
+        _ML_MIN_CONF = 0.10
+        ml_conf = 0.0
+        if self.ml_estimator is not None:
+            ml_up, ml_conf = self.ml_estimator.predict(points)
+            if ml_up is not None and up_ambiguous and ml_conf >= _ML_MIN_CONF:
+                # Align ML up to same hemisphere as PCA candidate (avoid flips)
+                if np.dot(ml_up, up_candidate) < 0:
+                    ml_up = -ml_up
+                t = ml_conf / (ml_conf + strength + 1e-9)
+                # Slerp between PCA and ML up vectors
+                cos_theta = np.clip(np.dot(up_candidate, ml_up), -1.0, 1.0)
+                theta = np.arccos(abs(cos_theta))
+                if theta < 1e-6:
+                    blended = up_candidate
+                else:
+                    blended = (np.sin((1 - t) * theta) * up_candidate
+                               + np.sin(t * theta) * ml_up) / np.sin(theta)
+                up_candidate = blended / (np.linalg.norm(blended) + 1e-9)
+                strength = (1 - t) * strength + t * ml_conf
+                print(f"[Estimator:object] ML up=[{ml_up[0]:.4f},{ml_up[1]:.4f},{ml_up[2]:.4f}]  "
+                      f"ml_conf={ml_conf:.3f}  blend_t={t:.3f}  (PCA ambiguous, blended)")
+            else:
+                if ml_up is None:
+                    reason = "unavailable"
+                elif not up_ambiguous:
+                    reason = f"skipped (PCA confident, strength={strength:.3f})"
+                else:
+                    reason = f"skipped (low-conf {ml_conf:.3f} < {_ML_MIN_CONF})"
+                print(f"[Estimator:object] ML {reason}, using PCA only")
+
         R = _rotation_align_vectors(up_candidate.astype(np.float32), UP_AXIS_WORLD)
 
         flags: List[str] = []
@@ -528,14 +596,16 @@ class GeometryAxisEstimator:
         # objects are heavily discounted so the UI/fusion can distrust them.
         confidence = float(np.clip(
             0.25 + 0.7 * strength * (0.4 if up_ambiguous else 1.0), 0.15, 0.9))
+        shape_type = "prolate(long-axis-up)" if gap_top >= gap_bot else "oblate(thin-axis-up)"
+        print(f"[Estimator:object] PCA  λ1={l1:.5f}  λ2={l2:.5f}  λ3={l3:.5f}")
+        print(f"[Estimator:object] gap_top={gap_top:.4f}  gap_bot={gap_bot:.4f}  "
+              f"shape={shape_type}  strength={strength:.4f}  up_ambiguous={up_ambiguous}")
+        print(f"[Estimator:object] up_candidate: [{up_candidate[0]:.4f}, {up_candidate[1]:.4f}, {up_candidate[2]:.4f}]  "
+              f"conf={confidence:.3f}  flags={flags}")
 
         T = np.eye(4, dtype=np.float32)
         T[:3, :3] = R.astype(np.float32)
         T[:3, 3] = -R.astype(np.float32) @ centroid.astype(np.float32)
-
-        # [M2 HOOK] — replace `up_candidate` with the ML-predicted up vector
-        # when its confidence exceeds this geometric `strength` margin; this
-        # is exactly where the `up_ambiguous` cases get rescued.
 
         return T, confidence, flags
 
@@ -567,20 +637,28 @@ class AlignmentEngine:
         self.cleaner = OutlierCleaner()
         self.classifier = ContentTypeClassifier()
         self.estimator = GeometryAxisEstimator()
+        if _ML_AVAILABLE:
+            self.estimator.ml_estimator = _MLAxisEstimator()
 
     def align(self, points: np.ndarray) -> AlignmentResult:
         if points.ndim != 2 or points.shape[1] != 3:
             raise ValueError(f"alignment expects (N,3) points; got {points.shape}")
+        print(f"\n[Engine] ── align() ──  input: {points.shape[0]:,} pts")
 
         cleaned, _mask = self.cleaner(points)
         if cleaned.shape[0] < 16:
             cleaned = points  # cleaner was too aggressive — fall back
+        print(f"[Engine] after outlier removal: {cleaned.shape[0]:,} pts")
 
         mode, cls_conf, diag = self.classifier(cleaned)
+        print(f"[Engine] classifier → mode={mode!r}  cls_conf={cls_conf:.3f}")
+
         T, est_conf, flags = self.estimator(cleaned, mode, diag)
+        print(f"[Engine] estimator  → est_conf={est_conf:.3f}  flags={flags}")
 
         # Geometric mean blends two probability-like numbers smoothly.
         confidence = float(math.sqrt(max(cls_conf, 1e-6) * max(est_conf, 1e-6)))
+        print(f"[Engine] fused conf: √({cls_conf:.3f} × {est_conf:.3f}) = {confidence:.3f}")
 
         return AlignmentResult(
             transform=T.astype(np.float32),
