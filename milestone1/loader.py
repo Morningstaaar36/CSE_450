@@ -383,10 +383,16 @@ def load_point_cloud(
 
     raw_pos, raw_col, is_gs, extras = _read_points(path)
     raw_n = int(raw_pos.shape[0])
+    print(f"[Loader] file:        {os.path.basename(path)}")
+    print(f"[Loader] raw points:  {raw_n:,}  |  is_3dgs={bool(is_gs)}")
     if raw_n == 0:
         raise ValueError(f"PLY file {path!r} contains zero vertices")
 
+    print(f"[Loader] downsampling (cap={point_cap:,}) …")
     pos, col, voxel_used = downsample_adaptive(raw_pos, raw_col, cap=point_cap)
+    vox_str = f"voxel_size={voxel_used:.5f}" if voxel_used else "no voxel needed (under cap)"
+    print(f"[Loader] kept:        {pos.shape[0]:,} / {raw_n:,}  |  {vox_str}")
+
     # Trim opacity to match if we sub-sampled randomly; otherwise drop it,
     # since voxel-bucketing scrambled per-point identity.
     kept_extras: dict = {}
@@ -394,6 +400,8 @@ def load_point_cloud(
         kept_extras["opacity"] = extras["opacity"]
 
     stats = compute_stats(pos)
+    print(f"[Loader] extent:      {stats.extent[0]:.3f} × {stats.extent[1]:.3f} × {stats.extent[2]:.3f}  scale={stats.scale:.4f}")
+    print(f"[Loader] centroid:    [{stats.centroid[0]:.3f}, {stats.centroid[1]:.3f}, {stats.centroid[2]:.3f}]")
 
     return PointCloud(
         positions=pos.astype(np.float32),

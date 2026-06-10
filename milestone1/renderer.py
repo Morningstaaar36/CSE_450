@@ -221,7 +221,10 @@ class VulkanRenderer:
     def mvp(self) -> np.ndarray:
         """projection · view · sceneRoot — the same matrix the shader uses."""
         aspect = max(self.width / max(self.height, 1), 1e-3)
-        p = perspective(self.camera.fovy_deg, aspect, 0.05, 1000.0)
+        d = max(self.camera.distance, 1e-3)
+        znear = d * 0.001
+        zfar  = d * 10.0
+        p = perspective(self.camera.fovy_deg, aspect, znear, zfar)
         v = self.camera.view()
         return (p @ v @ self.scene_root).astype(np.float32)
 

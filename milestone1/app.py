@@ -443,6 +443,8 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Alignment failed", f"{exc}")
             return
         self._sync_viewport()
+        print(f"[App] transform:\n{result.transform}")
+        print(f"[App] diagnostics: {result.diagnostics}")
         flags = f"  flags: {','.join(result.ambiguity_flags)}" if result.ambiguity_flags else ""
         self._refresh_status(
             f"PREVIEW: mode={result.mode}  conf={result.confidence:.2f}{flags}"
@@ -605,7 +607,9 @@ def main() -> int:
     # Open a file passed on the command line.
     if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
         try:
+            print(f"\n{'='*60}")
             pc = load_point_cloud(sys.argv[1])
+            print(f"{'='*60}\n")
             w._cloud = pc
             w._loaded_path = sys.argv[1]
             w._session = AlignmentSession()
