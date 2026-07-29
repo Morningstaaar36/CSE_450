@@ -64,7 +64,8 @@ DOWNLOAD_OBJAVERSE = False
 N_ROTATIONS = 30
 
 # Training hyperparameters
-BATCH_SIZE = 32          # Training batch size
+BATCH_SIZE = 4           # Micro-batch size to fit in memory
+GRAD_ACCUM_STEPS = 8     # Effective batch size = 4 * 8 = 32
 NUM_EPOCHS = 150          # Max training epochs (early stopping will kick in)
 LEARNING_RATE = 1e-3     # Adam learning rate
 WEIGHT_DECAY = 1e-4      # L2 regularization
@@ -75,7 +76,7 @@ FEAT_DIMS = (32, 64, 128)  # VN encoder channel dimensions
 HIDDEN_DIM = 256            # MLP head hidden size
 
 # VNN architecture (agnostic mode -- larger for cross-category capacity)
-AGNOSTIC_FEAT_DIMS = (64, 128, 256)
+AGNOSTIC_FEAT_DIMS = (32, 64, 128)
 AGNOSTIC_HIDDEN_DIM = 256
 N_CATEGORY_EMBED = 32       # Category embedding dimension
 
@@ -122,6 +123,7 @@ import shutil
 import time
 import tempfile
 import glob
+import math
 
 import numpy as np
 import torch
@@ -145,7 +147,10 @@ def load_mesh_or_pc(path):
             data = np.loadtxt(path, delimiter=',')
         except ValueError:
             data = np.loadtxt(path)
-        return trimesh.Trimesh(vertices=data[:, :3])
+        m = trimesh.Trimesh(vertices=data[:, :3])
+        if data.shape[1] >= 6:
+            m.vertex_normals = data[:, 3:6]
+        return m
     else:
         return trimesh.load(path, force="mesh")
 
@@ -288,6 +293,12 @@ class VNMaxPool(nn.Module):
         return pooled
 
 
+class VNMeanPool(nn.Module):
+    """SO(3)-equivariant mean pooling over the point dimension."""
+    def forward(self, x):
+        return x.mean(dim=1)
+
+
 class VNStdFeature(nn.Module):
     """Extract rotation-INVARIANT scalar features from equivariant vectors."""
     def __init__(self, in_channels):
@@ -304,42 +315,108 @@ class VNStdFeature(nn.Module):
         return invariant
 
 
-class VNPointNetEncoder(nn.Module):
-    """VN-PointNet encoder: lifts raw 3D points to equivariant vector features.
-    Input:  (B, N, 3) where N can be any number of points.
-    Output: (B, C, 3) global equivariant features after max-pooling over N.
+def knn_distance_invariant(x, k):
+    """SO(3)-invariant KNN based on inner products of vector features.
+    x: (B, C, 3, N) -> returns indices (B, N, k)
     """
-    def __init__(self, n_points=2048, feat_dims=(64, 128, 256)):
+    inner = torch.einsum('bcdn,bcdm->bnm', x, x) # (B, N, N)
+    x2 = torch.diagonal(inner, dim1=1, dim2=2).unsqueeze(2) # (B, N, 1)
+    dist = x2 + x2.transpose(1, 2) - 2 * inner
+    idx = dist.topk(k=k, dim=-1, largest=False)[1] # (B, N, k)
+    return idx
+
+def get_vn_graph_feature(x, k=20, idx=None):
+    """Extract VN EdgeConv features. x: (B, C, 3, N)"""
+    B, C, _, N = x.size()
+    if idx is None:
+        idx = knn_distance_invariant(x, k=k) # (B, N, k)
+        
+    idx_base = torch.arange(0, B, device=x.device).view(-1, 1, 1) * N
+    idx_flat = (idx + idx_base).view(-1)
+    
+    x_perm = x.permute(0, 3, 1, 2) # (B, N, C, 3)
+    x_flat = x_perm.reshape(B*N, C, 3) # (B*N, C, 3)
+    x_neighbors = x_flat[idx_flat].view(B, N, k, C, 3).permute(0, 3, 4, 1, 2) # (B, C, 3, N, k)
+    
+    x_central = x.unsqueeze(-1).expand(B, C, 3, N, k)
+    edge_feature = torch.cat([x_central, x_neighbors - x_central], dim=1) # (B, 2C, 3, N, k)
+    return edge_feature, idx
+
+class VNMaxPoolLocal(nn.Module):
+    """SO(3)-equivariant max pooling over local K-NN neighborhoods."""
+    def forward(self, x):
+        norms = torch.norm(x, dim=2) # (B, C, N, k)
+        max_idx = norms.argmax(dim=-1, keepdim=True) # (B, C, N, 1)
+        max_idx_expanded = max_idx.unsqueeze(2).expand(-1, -1, 3, -1, -1) # (B, C, 3, N, 1)
+        pooled = torch.gather(x, 4, max_idx_expanded).squeeze(-1) # (B, C, 3, N)
+        return pooled
+
+class VNDGCNNLayer(nn.Module):
+    def __init__(self, in_channels, out_channels, k=20):
+        super().__init__()
+        self.k = k
+        self.conv = VNLinear(in_channels * 2, out_channels)
+        self.act = VNLeakyReLU(out_channels)
+        self.pool = VNMaxPoolLocal()
+        
+    def forward(self, x, idx=None):
+        edge_feature, idx = get_vn_graph_feature(x, k=self.k, idx=idx) # (B, 2C, 3, N, k)
+        B, C2, _, N, k = edge_feature.size()
+        edge_flat = edge_feature.permute(0, 3, 4, 1, 2).reshape(B*N*k, C2, 3)
+        out_flat = self.act(self.conv(edge_flat))
+        out = out_flat.view(B, N, k, -1, 3).permute(0, 3, 4, 1, 2) # (B, C_out, 3, N, k)
+        return self.pool(out), idx
+
+class VNDGCNNEncoder(nn.Module):
+    """VN-DGCNN encoder: preserves local geometry via EdgeConv with
+    multi-scale feature aggregation.
+    
+    Input:  (B, N, 3)
+    Output: (B, C_total, 3) global equivariant features.
+    
+    Instead of only pooling the final layer (which loses fine-grained detail),
+    we concatenate features from ALL layers before global pooling, capturing
+    both local (early layers) and global (later layers) geometry.
+    """
+    def __init__(self, n_points=1024, feat_dims=(32, 64, 128), k=20):
         super().__init__()
         self.n_points = n_points
+        self.k = k
+        
         layers = []
         in_ch = 1
         for out_ch in feat_dims:
-            layers.append(VNLinear(in_ch, out_ch))
-            layers.append(VNLeakyReLU(out_ch, negative_slope=0.2))
+            layers.append(VNDGCNNLayer(in_ch, out_ch, k=self.k))
             in_ch = out_ch
-        self.vn_layers = nn.ModuleList(layers)
-        self.pool = VNMaxPool()
-        self.invariant = VNStdFeature(feat_dims[-1])
+        self.layers = nn.ModuleList(layers)
+        
+        # Multi-scale: concatenate all layer outputs then project to final dim
+        total_ch = sum(feat_dims)  # e.g. 32+64+128 = 224
+        self.fuse = VNLinear(total_ch, feat_dims[-1])  # project back to last_ch
+        self.fuse_act = VNLeakyReLU(feat_dims[-1])
+        
+        self.global_pool_max = VNMaxPool()
+        self.global_pool_mean = VNMeanPool()
 
     def forward(self, points):
-        B, N, _ = points.shape
-        x = points.unsqueeze(2)
-        for layer in self.vn_layers:
-            if isinstance(layer, VNLinear):
-                B_N = B * N
-                x_flat = x.reshape(B_N, -1, 3)
-                x_flat = layer(x_flat)
-                C_out = x_flat.shape[1]
-                x = x_flat.reshape(B, N, C_out, 3)
-            elif isinstance(layer, VNLeakyReLU):
-                B_N = B * N
-                x_flat = x.reshape(B_N, -1, 3)
-                x_flat = layer(x_flat)
-                x = x_flat.reshape(B, N, -1, 3)
-        x_global = self.pool(x)
-        # Return EQUIVARIANT features (B, C, 3) -- not invariant --
-        # so the selector can compute relative orientation via cross-Gram.
+        x = points.unsqueeze(1).permute(0, 1, 3, 2) # (B, 1, 3, N)
+        layer_outputs = []
+        for layer in self.layers:
+            x, _ = layer(x, idx=None)  # Recompute graph dynamically
+            layer_outputs.append(x)    # Each is (B, C_i, 3, N)
+            
+        # Concatenate multi-scale features: (B, sum(C_i), 3, N)
+        x_cat = torch.cat(layer_outputs, dim=1)
+        
+        # Fuse per-point: reshape to (B*N, total_ch, 3), apply VNLinear, reshape back
+        B, C_total, _, N = x_cat.size()
+        x_flat = x_cat.permute(0, 3, 1, 2).reshape(B * N, C_total, 3)
+        x_fused = self.fuse_act(self.fuse(x_flat))  # (B*N, last_ch, 3)
+        x_fused = x_fused.view(B, N, -1, 3)  # (B, N, last_ch, 3)
+            
+        x_max = self.global_pool_max(x_fused) # (B, C, 3)
+        x_mean = self.global_pool_mean(x_fused) # (B, C, 3)
+        x_global = torch.cat([x_max, x_mean], dim=1) # (B, 2C, 3)
         return x_global
 
 
@@ -359,16 +436,17 @@ class VNCandidateSelector(nn.Module):
         category_embed_dim: dimension of the category embedding
     """
     def __init__(self, n_points=1024, feat_dims=(32, 64, 128), hidden_dim=256,
-                 n_categories=0, category_embed_dim=32, reduce_dim=32):
+                 n_categories=0, category_embed_dim=32, reduce_dim=64, k=12):
         super().__init__()
         self.n_points = n_points
-        self.encoder = VNPointNetEncoder(n_points=n_points, feat_dims=feat_dims)
+        self.encoder = VNDGCNNEncoder(n_points=n_points, feat_dims=feat_dims, k=k)
 
-        last_ch = feat_dims[-1]
+        last_ch = feat_dims[-1] * 2  # Account for mean+max concat from encoder
 
         # Concatenate template and candidate equivariant features: 2*C channels.
-        # Apply a VNLinear bottleneck to drastically reduce channels before the 
-        # O(C^2) Gram matrix computation, avoiding massive Linear layers.
+        # Apply a VNLinear bottleneck to reduce channels before the 
+        # O(C^2) Gram matrix computation.  reduce_dim=64 keeps rich geometric
+        # detail (the old 32 was too lossy for distinguishing subtle rotations).
         self.reducer = VNLinear(last_ch * 2, reduce_dim)
         self.invariant = VNStdFeature(reduce_dim)
         inv_dim = reduce_dim * (reduce_dim + 1) // 2
@@ -383,12 +461,15 @@ class VNCandidateSelector(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(head_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.LeakyReLU(0.2),
+            nn.GELU(),
+            nn.Dropout(0.15),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.1),
+            nn.GELU(),
             nn.Linear(hidden_dim // 2, 1),
         )
         self._init_head()
@@ -473,6 +554,23 @@ def rot_y(theta):
     c, s = np.cos(theta), np.sin(theta)
     return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
 
+def chordal_l2_mean_np(rotations):
+    """Compute the chordal L2 mean of a list of numpy rotation matrices."""
+    R_sum = np.sum(rotations, axis=0)
+    U, _, Vt = np.linalg.svd(R_sum)
+    S = U @ Vt
+    if np.linalg.det(S) < 0:
+        U = U.copy()
+        U[:, -1] *= -1
+        S = U @ Vt
+    return S
+
+def rotation_angle_np(R1, R2):
+    """Geodesic angle (radians) between two numpy rotation matrices.
+    Uses ||R1-R2||_F = 2*sqrt(2)*sin(theta/2) which is exact near 0."""
+    d = np.sqrt(np.sum((R1 - R2) ** 2, axis=(-2, -1)) + 1e-24)
+    return 2.0 * np.arcsin(np.clip(d / (2.0 * np.sqrt(2.0)), a_min=None, a_max=1.0 - 1e-7))
+
 
 def rodrigues_rotation(n_from, n_to):
     """Rotation matrix that aligns unit vector n_from to n_to via Rodrigues.
@@ -545,34 +643,67 @@ def normalize_to_unit_sphere(mesh):
     return mesh
 
 
-def sample_points(mesh, n=None, seed=0):
-    """Sample n points uniformly from the mesh surface or point cloud."""
+def sample_points(mesh, n=None, seed=None, with_normals=False):
+    """Sample n points uniformly from the mesh surface or point cloud.
+    
+    Args:
+        seed: If None, uses fresh random state (avoids train/test leakage).
+              If an int, uses deterministic seeding (for template reproducibility).
+    """
     if n is None:
         n = N_POINTS
     st = np.random.get_state()
-    np.random.seed(seed)
+    if seed is not None:
+        np.random.seed(seed)
+    
+    has_normals = hasattr(mesh, "vertex_normals") and len(mesh.vertex_normals) > 0
     
     if hasattr(mesh, "faces") and len(mesh.faces) > 0:
-        pts, _ = trimesh.sample.sample_surface(mesh, n)
+        pts, faces_idx = trimesh.sample.sample_surface(mesh, n)
+        if with_normals:
+            if hasattr(mesh, 'face_normals') and len(mesh.face_normals) > 0:
+                normals = mesh.face_normals[faces_idx]
+            else:
+                normals = np.zeros_like(pts)
     else:
         pts = mesh.vertices
+        idx = None
         if len(pts) > n:
             idx = np.random.choice(len(pts), n, replace=False)
             pts = pts[idx]
         elif len(pts) > 0 and len(pts) < n:
             idx = np.random.choice(len(pts), n, replace=True)
             pts = pts[idx]
+        
+        if with_normals:
+            if has_normals:
+                all_normals = mesh.vertex_normals
+                normals = all_normals[idx] if idx is not None else all_normals
+            else:
+                normals = np.zeros_like(pts)
             
-    np.random.set_state(st)
+    if seed is not None:
+        np.random.set_state(st)
+    if with_normals:
+        return np.asarray(pts, dtype=np.float32), np.asarray(normals, dtype=np.float32)
     return np.asarray(pts, dtype=np.float32)
 
 
-def chamfer_distance(a, b):
-    """Chamfer distance between two point clouds (mean of nearest-neighbour dists)."""
+def chamfer_distance(a, b, na=None, nb=None, alpha=0.5):
+    """Chamfer distance between two point clouds (mean of nearest-neighbour dists).
+    Optional normal penalty: penalizes point matches with opposing normals.
+    """
     ta, tb = cKDTree(a), cKDTree(b)
-    d_ab, _ = tb.query(a)
-    d_ba, _ = ta.query(b)
-    return float(d_ab.mean() + d_ba.mean())
+    d_ab, idx_ab = tb.query(a)
+    d_ba, idx_ba = ta.query(b)
+    
+    cd_val = float(d_ab.mean() + d_ba.mean())
+    if na is not None and nb is not None:
+        dot_ab = np.sum(na * nb[idx_ab], axis=1)
+        dot_ba = np.sum(nb * na[idx_ba], axis=1)
+        normal_loss = float((1 - dot_ab).mean() + (1 - dot_ba).mean())
+        return cd_val + alpha * normal_loss
+    return cd_val
 
 
 def chamfer_distance_fast(a, b, tree_b=None, max_pts=256):
@@ -828,7 +959,10 @@ def geometric_horizontal(obj_pts, tpl_pts, steps=None, tpl_tree=None):
     if steps is None:
         steps = THETA_STEPS
     thetas = np.linspace(0, 2 * np.pi, steps, endpoint=False)
-    tpl_sub = tpl_pts if len(tpl_pts) <= 256 else tpl_pts[:256]
+    if len(tpl_pts) > 256:
+        tpl_sub = tpl_pts[np.random.choice(len(tpl_pts), 256, replace=False)]
+    else:
+        tpl_sub = tpl_pts
     if tpl_tree is None:
         tpl_tree = cKDTree(tpl_sub)
     Eg = np.array([chamfer_distance_fast((rot_y(t) @ obj_pts.T).T, tpl_sub, tree_b=tpl_tree) for t in thetas])
@@ -1064,6 +1198,9 @@ class CategoryDiscovery:
             categories = CATEGORIES
         if model_name is None:
             model_name = CLIP_MODEL_NAME
+        
+        print("Initializing CLIP Model...")
+        print("Categories: ", categories)
         self.categories = list(categories)
         self.model_name = model_name
         self._model = None
@@ -1193,9 +1330,13 @@ def download_objects(uids):
 # SELF-SUPERVISED LABELING
 # =====================================================================
 
-def compute_auto_label(candidate_pts_list, template_pts):
+def compute_auto_label(candidate_pts_list, template_pts, candidate_normals_list=None, template_normals=None):
     """Pick candidate with lowest Chamfer distance to template (self-supervised)."""
-    distances = [chamfer_distance(cpts, template_pts) for cpts in candidate_pts_list]
+    distances = []
+    for i, cpts in enumerate(candidate_pts_list):
+        cn = candidate_normals_list[i] if candidate_normals_list else None
+        d = chamfer_distance(cpts, template_pts, na=cn, nb=template_normals)
+        distances.append(d)
     return int(np.argmin(distances)), distances
 
 
@@ -1361,18 +1502,42 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
         print(f"\n  Resolving {len(download_uids)} local ModelNet40 objects...")
     objs = download_objects(download_uids)
 
-    print("\n  Setting up canonical template...")
-    template_uid = uids[0]
+    print("\n  Setting up canonical template (Medoid Selection)...")
+    # Evaluate first 15 objects to find the "most average" (medoid) template
+    num_medoid_cands = min(15, len(uids))
+    medoid_pts_list = []
+    medoid_uids = uids[:num_medoid_cands]
+    
+    for uid in medoid_uids:
+        tpl_path = objs.get(uid)
+        if tpl_path is None: continue
+        m = normalize_to_unit_sphere(load_mesh_or_pc(tpl_path))
+        pts = sample_points(m, seed=42, with_normals=False)
+        medoid_pts_list.append((uid, pts))
+        
+    best_medoid_uid = medoid_uids[0]
+    best_medoid_score = float('inf')
+    for i, (uid_i, pts_i) in enumerate(medoid_pts_list):
+        score = 0
+        for j, (uid_j, pts_j) in enumerate(medoid_pts_list):
+            if i != j:
+                score += chamfer_distance(pts_i, pts_j)
+        if score < best_medoid_score:
+            best_medoid_score = score
+            best_medoid_uid = uid_i
+
+    template_uid = best_medoid_uid
     tpl_path = objs.get(template_uid)
     if tpl_path is None:
         raise RuntimeError(f"Template {template_uid} failed to download!")
     tpl_mesh = normalize_to_unit_sphere(load_mesh_or_pc(tpl_path))
-    template_pts = sample_points(tpl_mesh)
-    print(f"  Template UID: {template_uid[:16]}...")
+    template_pts, template_normals = sample_points(tpl_mesh, seed=42, with_normals=True)
+    print(f"  Template UID selected: {template_uid[:16]}...")
 
     target_str = f"{n_objects}" if (USE_ONLY_N_SAMPLES and n_objects is not None) else f"ALL ({len(uids)-1})"
     print(f"\n  Processing objects (target: {target_str})...")
     data_objects = []
+    all_best_dists = []
     discarded = 0
 
     total_items = (min(len(uids)-1, n_objects+50)) if (USE_ONLY_N_SAMPLES and n_objects is not None) else (len(uids)-1)
@@ -1399,14 +1564,22 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
             continue
 
         candidates = generate_five_candidates(mesh, template_pts, category=category)
-        obj_pts = sample_points(mesh)
-        cand_pts_list, cand_rot_list, cand_name_list = [], [], []
+        obj_pts, obj_normals = sample_points(mesh, with_normals=True)
+        cand_pts_list, cand_normals_list, cand_rot_list, cand_name_list = [], [], [], []
         for name, R in candidates:
             cand_pts_list.append((R @ obj_pts.T).T)
+            cand_normals_list.append((R @ obj_normals.T).T)
             cand_rot_list.append(R)
             cand_name_list.append(name)
 
-        best_idx, cd_dists = compute_auto_label(cand_pts_list, template_pts)
+        best_idx, cd_dists = compute_auto_label(
+            cand_pts_list, template_pts,
+            candidate_normals_list=cand_normals_list,
+            template_normals=template_normals
+        )
+        
+        all_best_dists.append(cd_dists[best_idx])
+            
         safe_uid = os.path.basename(uid)
         data_objects.append({
             "uid": safe_uid,
@@ -1419,7 +1592,22 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
         pbar.set_postfix(good=len(data_objects), bad=discarded)
     pbar.close()
 
-    print(f"\n  Prepared {len(data_objects)} objects, discarded {discarded}.")
+    # ---- Adaptive distance threshold filtering (lenient: median + 3σ) ----
+    if all_best_dists:
+        dist_arr = np.array(all_best_dists)
+        threshold = np.median(dist_arr) + 3.0 * np.std(dist_arr)
+        print(f"  Adaptive threshold: {threshold:.4f} (median={np.median(dist_arr):.4f}, std={np.std(dist_arr):.4f})")
+        before_count = len(data_objects)
+        filtered_objects = []
+        for obj, d in zip(data_objects, all_best_dists):
+            if d <= threshold:
+                filtered_objects.append(obj)
+            else:
+                discarded += 1
+        data_objects = filtered_objects
+        print(f"  Adaptive filter removed {before_count - len(data_objects)} outliers.")
+
+    print(f"\n  Final: {len(data_objects)} objects, discarded {discarded} total.")
     if discarded + len(data_objects) > 0:
         print(f"  Discard rate: {discarded / (discarded + len(data_objects)) * 100:.1f}%")
     from collections import Counter
@@ -1509,7 +1697,9 @@ def train_one_epoch_ranking(model, dataloader, optimizer, device, epoch,
     model.train()
     total_loss = 0.0
     correct, total = 0, 0
-    for batch in dataloader:
+    
+    optimizer.zero_grad()
+    for batch_idx, batch in enumerate(dataloader):
         template = batch["template_pts"].to(device)      # (B, N, 3)
         candidates = batch["candidate_pts"].to(device)    # (B, 5, N, 3)
         best_idx = batch["best_idx"].to(device)           # (B,)
@@ -1526,16 +1716,24 @@ def train_one_epoch_ranking(model, dataloader, optimizer, device, epoch,
             logits_list.append(s)
         logits = torch.cat(logits_list, dim=1)  # (B, 5)
 
-        loss = F.cross_entropy(logits, best_idx)
+        loss = F.cross_entropy(logits, best_idx, label_smoothing=0.05)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        scaled_loss = loss / GRAD_ACCUM_STEPS
+        scaled_loss.backward()
+
+        if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0:
+            optimizer.step()
+            optimizer.zero_grad()
 
         preds = logits.argmax(dim=1)
         correct += (preds == best_idx).sum().item()
         total += B
         total_loss += loss.item() * B
+
+    if len(dataloader) % GRAD_ACCUM_STEPS != 0:
+        optimizer.step()
+        optimizer.zero_grad()
+
     return {"loss": total_loss / total if total else 0, "selection_accuracy": correct / total if total else 0}
 
 
@@ -2309,6 +2507,150 @@ def align_single_object(mesh_or_path, template_mesh_or_pts=None, category=None):
 
 
 # =====================================================================
+# METRICS EVALUATION (Stability & Consistency)
+# =====================================================================
+
+def evaluate_stability_consistency(category, num_objects=10, k_rotations=5):
+    """Evaluate per-category Stability and Consistency metrics."""
+    print(f"\n" + "=" * 60)
+    print(f"  EVALUATING STABILITY & CONSISTENCY [{category.upper()}]")
+    print(f"=" * 60)
+
+    uids = load_category_uids(category, num_objects + 10)
+    if not uids or len(uids) < 2:
+        print(f"  [!] Not enough '{category}' objects found.")
+        return 0, 0
+        
+    random.shuffle(uids)
+    download_uids = uids[:min(len(uids), num_objects + 10)]
+    objs = download_objects(download_uids)
+
+    cache_file = get_cache_file(category)
+    if os.path.exists(cache_file):
+        data = torch.load(cache_file, weights_only=False)
+        template_pts = data["template_pts"]
+    else:
+        print(f"  [!] No template for '{category}'. Skipping evaluation.")
+        return 0, 0
+
+    valid_objects = []
+    for uid in download_uids:
+        path = objs.get(uid)
+        if not path: continue
+        try:
+            mesh = normalize_to_unit_sphere(load_mesh_or_pc(path))
+            ok, _ = passes_quality(mesh)
+            if ok:
+                valid_objects.append(mesh)
+            if len(valid_objects) >= num_objects:
+                break
+        except Exception:
+            continue
+            
+    if len(valid_objects) < 2:
+        print(f"  [!] Need at least 2 valid objects. Found {len(valid_objects)}.")
+        return 0, 0
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = None
+    vnn_cat_idx = None
+
+    agnostic_path = get_agnostic_model_path()
+    if os.path.exists(agnostic_path):
+        ckpt = torch.load(agnostic_path, weights_only=False, map_location=device)
+        cat_to_idx = ckpt.get("category_to_idx", {})
+        model = VNCandidateSelector(
+            n_points=ckpt.get("n_points", N_POINTS),
+            feat_dims=ckpt.get("feat_dims", AGNOSTIC_FEAT_DIMS),
+            hidden_dim=ckpt.get("hidden_dim", AGNOSTIC_HIDDEN_DIM),
+            n_categories=ckpt.get("n_categories", 0),
+            category_embed_dim=ckpt.get("category_embed_dim", N_CATEGORY_EMBED),
+        ).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
+        if category in cat_to_idx:
+            vnn_cat_idx = cat_to_idx[category]
+    else:
+        per_cat_path = get_best_model_path(category)
+        if os.path.exists(per_cat_path):
+            ckpt = torch.load(per_cat_path, weights_only=False, map_location=device)
+            model = VNCandidateSelector(
+                n_points=ckpt.get("n_points", N_POINTS),
+                feat_dims=ckpt.get("feat_dims", FEAT_DIMS),
+                hidden_dim=ckpt.get("hidden_dim", HIDDEN_DIM),
+                n_categories=ckpt.get("n_categories", 0),
+            ).to(device)
+            model.load_state_dict(ckpt["model_state_dict"])
+            model.eval()
+
+    if model is None:
+        print(f"  [!] No VNN model found for '{category}'. Skipping.")
+        return 0, 0
+
+    print(f"  Evaluating {len(valid_objects)} objects with {k_rotations} rotations each...")
+    tpl_tensor = torch.tensor(template_pts, dtype=torch.float32).unsqueeze(0).to(device)
+    cat_tensor = torch.tensor([vnn_cat_idx], dtype=torch.long).to(device) if vnn_cat_idx is not None else None
+
+    def get_predicted_rotation(mesh_input, R_rand):
+        # We manually rotate points and normals to be safe instead of using mesh.apply_transform
+        # because Trimesh apply_transform might drop or incorrectly transform custom vertex_normals.
+        pts, norms = sample_points(mesh_input, with_normals=True)
+        pts_rot = (R_rand @ pts.T).T
+        norms_rot = (R_rand @ norms.T).T
+        
+        rot_mesh = trimesh.Trimesh(vertices=pts_rot)
+        rot_mesh.vertex_normals = norms_rot
+        
+        candidates = generate_five_candidates(rot_mesh, template_pts, category=category)
+        
+        scores = []
+        cand_R = []
+        with torch.no_grad():
+            for name, R_cand in candidates:
+                cand_R.append(R_cand)
+                rotated = (R_cand @ pts_rot.T).T
+                ct = torch.tensor(rotated, dtype=torch.float32).unsqueeze(0).to(device)
+                s = model(tpl_tensor, ct, category_idx=cat_tensor)
+                scores.append(s.item())
+        best_idx = int(np.argmax(scores))
+        
+        # The true canonicalizing rotation from the ORIGINAL shape is R_cand * R_rand
+        return cand_R[best_idx] @ R_rand
+
+    stability_scores = []
+    canonical_rotations_per_object = []
+
+    for mesh in valid_objects:
+        obj_canon_rotations = []
+        for _ in range(k_rotations):
+            R_rand = random_rotation_matrix()
+            R_pred = get_predicted_rotation(mesh, R_rand)
+            obj_canon_rotations.append(R_pred)
+            
+        # Stability: RMS spread from the chordal L2 mean
+        R_mean = chordal_l2_mean_np(obj_canon_rotations)
+        angs = [rotation_angle_np(R, R_mean) for R in obj_canon_rotations]
+        rms_ang_deg = np.sqrt(np.mean(np.array(angs)**2)) * 180.0 / math.pi
+        
+        stability_scores.append(rms_ang_deg)
+        canonical_rotations_per_object.append(obj_canon_rotations[0])
+
+    avg_stability = np.mean(stability_scores)
+    
+    # Consistency: RMS spread across different objects (vs their mean)
+    R_mean_cons = chordal_l2_mean_np(canonical_rotations_per_object)
+    angs_cons = [rotation_angle_np(R, R_mean_cons) for R in canonical_rotations_per_object]
+    rms_cons_deg = np.sqrt(np.mean(np.array(angs_cons)**2)) * 180.0 / math.pi
+                
+    avg_consistency = rms_cons_deg
+
+    print(f"\n  [RESULTS] Category: {category.upper()}")
+    print(f"    Stability (k={k_rotations}):   {avg_stability:.2f}° (Ideal: 0°)")
+    print(f"    Consistency (n={n}): {avg_consistency:.2f}° (Ideal: 0°)\n")
+    
+    return avg_stability, avg_consistency
+
+# =====================================================================
 # TOP-LEVEL ENTRY POINTS
 # =====================================================================
 
@@ -2343,8 +2685,17 @@ def run_pipeline(mode, categories=None):
             total_d += d
         print(f"\n  Total: {total_p} prepared, {total_d} discarded, {time.time()-t0:.1f}s")
 
+    elif mode == "evaluate_metrics":
+        print("\n" + "#" * 60)
+        print("  EVALUATING STABILITY & CONSISTENCY FOR ALL CATEGORIES")
+        print("#" * 60)
+        t0 = time.time()
+        for cat in categories:
+            evaluate_stability_consistency(cat)
+        print(f"\n  Total evaluation time: {time.time()-t0:.1f}s")
+
     else:
-        print(f"  Unknown mode: {mode}. Use 'train' or 'generate'.")
+        print(f"  Unknown mode: {mode}. Use 'train', 'generate', or 'evaluate_metrics'.")
 
 
 def run_all(categories=None):
@@ -2366,6 +2717,9 @@ def run_all(categories=None):
 
     # Step 2: Generate
     run_pipeline("generate", categories)
+
+    # Step 3: Calculate stablility and consistency
+    run_pipeline("evaluate_metrics")
 
     grand_time = time.time() - grand_start
     print(f"\n{'#'*60}")
@@ -2396,6 +2750,9 @@ def run_agnostic(categories=None):
 
     # Step 2: Generate using agnostic model
     run_pipeline("generate", categories)
+
+    # Step 3: Calculate stablility and consistency
+    run_pipeline("evaluate_metrics")
 
     grand_time = time.time() - grand_start
     print(f"\n{'#'*60}")
