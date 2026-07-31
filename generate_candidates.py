@@ -15,7 +15,6 @@ Implements the full CanoVerse paper method:
   - SO(3) rotation augmentation (40 random rotations per sample)
   - CLIP-based zero-shot category discovery (Uni3D proxy)
   - Category-agnostic cross-category training with ranking loss
-  - Geodesic evaluation metrics (Acc@10, Acc@30)
 
 Two training modes:
   - Per-category:  One VNN per category (backward-compatible)
@@ -57,8 +56,8 @@ N_GENERATE = 5
 # Point cloud settings
 N_POINTS = 1024          # Points sampled per mesh surface (consistent everywhere)
 
-# Download from Objaverse (True) or use Kaggle ModelNet40 Point Clouds (False)
-DOWNLOAD_OBJAVERSE = False
+# Dataset Source: "canoverse" (for Kaggle glb data) or "modelnet40" (for txt point clouds)
+DATASET_SOURCE = "canoverse"
 
 # Rotation augmentation (paper: 40 random rotations per sample)
 N_ROTATIONS = 30
@@ -130,7 +129,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-!pip -q install trimesh objaverse
+!pip -q install trimesh
 import trimesh
 from PIL import Image
 from scipy.spatial import cKDTree, ConvexHull
@@ -153,45 +152,6 @@ def load_mesh_or_pc(path):
         return m
     else:
         return trimesh.load(path, force="mesh")
-
-
-# =====================================================================
-# CATEGORY CONFIGURATION
-# =====================================================================
-
-# Per-category strict Objaverse keyword filtering
-CATEGORY_FILTERS = {
-    "table": {
-        "include": ["table", "desk"],
-        "exclude": [
-            "periodic", "pool", "billiard", "turntable", "timetable",
-            "printable", "stable", "notable", "portable", "vegetable",
-            "comfortable", "charitable", "suitable", "tablet",
-        ],
-    },
-    "chair": {
-        "include": ["chair"],
-        "exclude": [
-            "wheelchair", "chairlift", "chairman", "stairchair",
-        ],
-    },
-    "car": {
-        "include": ["car"],
-        "exclude": [
-            "card", "cart", "carpet", "cargo", "carrot", "care",
-            "cartoon", "cardinal", "carbon", "carnival", "oscar",
-            "scar", "boxcar", "carriage", "carousel", "carrier",
-            "card game", "playing card", "postcard", "carton",
-        ],
-    },
-    "airplane": {
-        "include": ["airplane", "aeroplane", "aircraft", "jet", "plane"],
-        "exclude": [
-            "jetski", "planet", "planer", "plank", "plant",
-            "plantation", "planetarium",
-        ],
-    },
-}
 
 # Symmetry definitions per category (paper §3.1)
 # angle=0 means no symmetry, angle=180 means bilateral, angle=360 means full rotational
@@ -299,6 +259,22 @@ class VNMeanPool(nn.Module):
         return x.mean(dim=1)
 
 
+class VNChannelAttention(nn.Module):
+    """Equivariant Channel Attention (SE-Block) for Vector Neurons."""
+    def __init__(self, in_channels, reduction=4):
+        super().__init__()
+        # Operate on invariant norms, so we use standard nn.Linear
+        self.fc1 = nn.Linear(in_channels, in_channels // reduction)
+        self.fc2 = nn.Linear(in_channels // reduction, in_channels)
+    
+    def forward(self, x):
+        # x: (B, C, 3)
+        norms = torch.norm(x, dim=-1) # (B, C) rotation-invariant
+        attn = F.relu(self.fc1(norms))
+        attn = torch.sigmoid(self.fc2(attn)) # (B, C)
+        return x * attn.unsqueeze(-1) # Broadcast over 3D coordinates
+
+
 class VNStdFeature(nn.Module):
     """Extract rotation-INVARIANT scalar features from equivariant vectors."""
     def __init__(self, in_channels):
@@ -397,6 +373,9 @@ class VNDGCNNEncoder(nn.Module):
         
         self.global_pool_max = VNMaxPool()
         self.global_pool_mean = VNMeanPool()
+        
+        # Channel attention (SE-block) over the concatenated global features
+        self.channel_attention = VNChannelAttention(feat_dims[-1] * 2)
 
     def forward(self, points):
         x = points.unsqueeze(1).permute(0, 1, 3, 2) # (B, 1, 3, N)
@@ -417,6 +396,9 @@ class VNDGCNNEncoder(nn.Module):
         x_max = self.global_pool_max(x_fused) # (B, C, 3)
         x_mean = self.global_pool_mean(x_fused) # (B, C, 3)
         x_global = torch.cat([x_max, x_mean], dim=1) # (B, 2C, 3)
+        
+        # Apply equivariant channel attention
+        x_global = self.channel_attention(x_global)
         return x_global
 
 
@@ -1085,7 +1067,7 @@ def passes_quality(mesh):
       - Degenerate faces (extreme area variance)
     """
     # Basic geometry checks
-    if not DOWNLOAD_OBJAVERSE or len(mesh.faces) == 0:
+    if DATASET_SOURCE == "modelnet40" or len(mesh.faces) == 0:
         return True, "ok"
     if len(mesh.faces) < MIN_FACES:
         return False, "too few faces"
@@ -1255,75 +1237,49 @@ class CategoryDiscovery:
 
 
 # =====================================================================
-# OBJAVERSE DATA LOADING
+# DATASET LOADING
 # =====================================================================
 
 def load_category_uids(category, n_needed=None):
-    """Fetch object UIDs from Objaverse with strict per-category filtering, or from local ModelNet40 if disabled."""
-    if not DOWNLOAD_OBJAVERSE:
+    """Fetch object file paths from local Kaggle datasets (ModelNet40 or CanoVerse)."""
+    if DATASET_SOURCE == "modelnet40":
         pattern = f"/kaggle/input/datasets/tasnimulislammahi/modelnet40/modelnet40_normal_resampled/{category}/*.txt"
         files = glob.glob(pattern)
         if not files:
-            # Fallback path if Kaggle structures it slightly differently
             pattern2 = f"/kaggle/input/*/modelnet40_normal_resampled/{category}/*.txt"
             files = glob.glob(pattern2)
-        print(f"  Found {len(files)} local '{category}' files.")
+        print(f"  Found {len(files)} local '{category}' files in ModelNet40.")
         if n_needed is not None:
             return files[:n_needed]
         return files
-
-    import objaverse
-
-    filters = CATEGORY_FILTERS.get(category, {"include": [category], "exclude": []})
-    include_words = filters["include"]
-    exclude_substrings = filters["exclude"]
-
-    print(f"  Querying Objaverse for '{category}' objects...")
-    uids = objaverse.load_uids()
-    annotations = objaverse.load_annotations(uids[:50000])
-
-    selected_uids = []
-    for uid, anno in annotations.items():
-        tags = [t['name'].lower() for t in anno.get('tags', [])]
-        name_lower = anno.get('name', '').lower()
-        name_words = name_lower.replace('-', ' ').replace('_', ' ').split()
-
-        has_include = any(word in tags or word in name_words for word in include_words)
-        if not has_include:
-            continue
-
-        has_exclude = any(exc in name_lower for exc in exclude_substrings)
-        if has_exclude:
-            continue
-
-        selected_uids.append(uid)
-        if n_needed is not None and len(selected_uids) >= n_needed:
-            break
-
-    print(f"  Found {len(selected_uids)} '{category}' objects.")
-    return selected_uids
+        
+    elif DATASET_SOURCE == "canoverse":
+        # Search for all .glb files in the canoverse directory
+        pattern = "/kaggle/input/*/canoverse_320k_upload*/*/*.glb"
+        all_files = glob.glob(pattern)
+        
+        selected_files = []
+        cat_lower = category.lower()
+        for file_path in all_files:
+            # Extract the folder name, e.g., 'suit_(clothing)' or 'table-tennis_table'
+            parent_dir = os.path.basename(os.path.dirname(file_path)).lower()
+            
+            # Match exact category or category with disambiguation suffix (e.g. table_(furniture))
+            if parent_dir == cat_lower or parent_dir.startswith(f"{cat_lower}_"):
+                selected_files.append(file_path)
+                if n_needed is not None and len(selected_files) >= n_needed:
+                    break
+                
+        print(f"  Found {len(selected_files)} '{category}' objects in CanoVerse.")
+        return selected_files
+        
+    else:
+        raise ValueError(f"Unknown DATASET_SOURCE: {DATASET_SOURCE}")
 
 
 def download_objects(uids):
-    """Download 3D objects from Objaverse by UID safely, or return local paths if disabled."""
-    if not DOWNLOAD_OBJAVERSE:
-        # uids are already local file paths when DOWNLOAD_OBJAVERSE is False
-        return {uid: uid for uid in uids}
-
-    import objaverse
-    try:
-        objs = objaverse.load_objects(uids=uids, download_processes=1)
-        return objs
-    except Exception as e:
-        print(f"  [!] Batch download error: {e}. Trying item-by-item...")
-        objs = {}
-        for uid in tqdm(uids, desc="  Item-by-item download", leave=False):
-            try:
-                res = objaverse.load_objects(uids=[uid], download_processes=1)
-                objs.update(res)
-            except Exception as item_err:
-                print(f"  [!] Skipping {uid}: {item_err}")
-        return objs
+    """Return local paths (uids are already local file paths)."""
+    return {uid: uid for uid in uids}
 
 
 # =====================================================================
@@ -1496,10 +1452,7 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
     random.shuffle(uids)
 
     download_uids = uids[:min(len(uids), needed + 50)] if needed else uids
-    if DOWNLOAD_OBJAVERSE:
-        print(f"\n  Downloading {len(download_uids)} objects...")
-    else:
-        print(f"\n  Resolving {len(download_uids)} local ModelNet40 objects...")
+    print(f"\n  Resolving {len(download_uids)} local {DATASET_SOURCE} objects...")
     objs = download_objects(download_uids)
 
     print("\n  Setting up canonical template (Medoid Selection)...")
@@ -1529,7 +1482,7 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
     template_uid = best_medoid_uid
     tpl_path = objs.get(template_uid)
     if tpl_path is None:
-        raise RuntimeError(f"Template {template_uid} failed to download!")
+        raise RuntimeError(f"Template {template_uid} failed to resolve!")
     tpl_mesh = normalize_to_unit_sphere(load_mesh_or_pc(tpl_path))
     template_pts, template_normals = sample_points(tpl_mesh, seed=42, with_normals=True)
     print(f"  Template UID selected: {template_uid[:16]}...")
@@ -1785,26 +1738,26 @@ def evaluate_ranking(model, dataloader, device, phase="VAL", use_category=False)
 # GEODESIC EVALUATION METRICS  (Paper §4 — Acc@10, Acc@30)
 # =====================================================================
 
-def compute_geodesic_metrics(predicted_rotations, gt_rotations):
-    """Compute geodesic error metrics between predicted and ground-truth rotations.
+# def compute_geodesic_metrics(predicted_rotations, gt_rotations):
+#     """Compute geodesic error metrics between predicted and ground-truth rotations.
 
-    Returns:
-        dict with acc_at_10, acc_at_30, median_error_deg, mean_error_deg
-    """
-    errors = []
-    for R_pred, R_gt in zip(predicted_rotations, gt_rotations):
-        errors.append(geodesic_angle_deg(
-            np.asarray(R_pred, dtype=np.float64),
-            np.asarray(R_gt, dtype=np.float64),
-        ))
-    errors = np.array(errors)
-    return {
-        "acc_at_10": float((errors <= 10).mean()) if len(errors) else 0.0,
-        "acc_at_30": float((errors <= 30).mean()) if len(errors) else 0.0,
-        "median_error_deg": float(np.median(errors)) if len(errors) else 0.0,
-        "mean_error_deg": float(np.mean(errors)) if len(errors) else 0.0,
-        "n_samples": len(errors),
-    }
+#     Returns:
+#         dict with acc_at_10, acc_at_30, median_error_deg, mean_error_deg
+#     """
+#     errors = []
+#     for R_pred, R_gt in zip(predicted_rotations, gt_rotations):
+#         errors.append(geodesic_angle_deg(
+#             np.asarray(R_pred, dtype=np.float64),
+#             np.asarray(R_gt, dtype=np.float64),
+#         ))
+#     errors = np.array(errors)
+#     return {
+#         "acc_at_10": float((errors <= 10).mean()) if len(errors) else 0.0,
+#         "acc_at_30": float((errors <= 30).mean()) if len(errors) else 0.0,
+#         "median_error_deg": float(np.median(errors)) if len(errors) else 0.0,
+#         "mean_error_deg": float(np.mean(errors)) if len(errors) else 0.0,
+#         "n_samples": len(errors),
+#     }
 
 
 # =====================================================================
@@ -2305,7 +2258,7 @@ def generate_category(category):
     objs = download_objects([template_uid])
     tpl_path = objs.get(template_uid)
     if tpl_path is None:
-        print(f"  [!] Template download failed. Skipping.")
+        print(f"  [!] Template resolution failed. Skipping.")
         return 0, 0
     tpl_mesh = normalize_to_unit_sphere(load_mesh_or_pc(tpl_path))
     tpl_pts = sample_points(tpl_mesh)
