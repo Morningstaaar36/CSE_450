@@ -96,8 +96,10 @@ MAX_SUPPORT_FACES = 50   # Max convex hull faces to evaluate (paper uses all; 50
 
 # CLIP settings (for zero-shot category discovery)
 CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
+USE_PYRENDER = True            # Set True for GPU hardware pyrender (EGL), False for pure matplotlib CPU renderer
 
-# Paths
+# Dataset Paths
+DATASET_DIR = "/kaggle/input/datasets/tasnimulislammahi/canoverse-2"  # Set explicitly or leave empty for auto-detection
 OUT_ROOT = "renders"
 CACHE_DIR = "data_cache"
 CHECKPOINT_DIR = "checkpoints"
@@ -109,22 +111,32 @@ RANDOM_SEED = 42
 # END CONFIG
 # =====================================================================
 
+import io
 import json
 import os
 import random
 import shutil
-import time
-import tempfile
-import glob
-import math
+import subprocess
+import sys
 import threading
+import time
+import math
+from collections import defaultdict
+
+for pkg in ["trimesh", "transformers", "pyrender"]:
+    try:
+        __import__(pkg)
+    except ImportError:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+        except Exception:
+            pass
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-!pip -q install trimesh
 import trimesh
 from PIL import Image
 from scipy.optimize import linear_sum_assignment
@@ -137,29 +149,93 @@ from tqdm import tqdm
 
 os.environ.pop("PYOPENGL_PLATFORM", None)
 
+_DATASET_INDEX = None
+
+
+def find_dataset_root():
+    """Locate the exact CanoVerse dataset root containing category folders."""
+    candidates = [
+        DATASET_DIR,
+        "/kaggle/input/datasets/tasnimulislammahi/canoverse-2",
+        "/kaggle/input/canoverse-2",
+        "/kaggle/input/canoverse",
+        "../input/datasets/tasnimulislammahi/canoverse-2",
+        "../input/canoverse-2",
+        "./datasets/canoverse-2",
+        "./data_cache/canoverse-2",
+    ]
+    for c in candidates:
+        if c and os.path.isdir(c):
+            subdirs = [d for d in os.listdir(c) if os.path.isdir(os.path.join(c, d)) and not d.startswith(".")]
+            if len(subdirs) >= 2:
+                return os.path.realpath(c)
+
+    for search_root in ["/kaggle/input", "../input", "./datasets", "./data_cache", "."]:
+        if os.path.isdir(search_root):
+            for root, dirs, _ in os.walk(search_root, followlinks=True):
+                if "canoverse" in os.path.basename(root).lower():
+                    subdirs = [d for d in dirs if not d.startswith(".") and d not in ("renders", "checkpoints")]
+                    if len(subdirs) >= 2:
+                        return os.path.realpath(root)
+    return None
+
+
+def get_dataset_index():
+    """Build or retrieve a fast in-memory dictionary mapping exact category names to their .glb files."""
+    global _DATASET_INDEX
+    if _DATASET_INDEX is not None:
+        return _DATASET_INDEX
+
+    root = find_dataset_root()
+    index = defaultdict(list)
+
+    if root and os.path.isdir(root):
+        print(f"  [Dataset] Found dataset root: {root}")
+        for entry in sorted(os.listdir(root)):
+            cat_dir = os.path.join(root, entry)
+            if os.path.isdir(cat_dir) and not entry.startswith("."):
+                cat_name = entry.lower().strip()
+                if cat_name in ("renders", "checkpoints", ".git", ".ipynb_checkpoints", "__pycache__"):
+                    continue
+                glbs = [
+                    os.path.realpath(os.path.join(cat_dir, f))
+                    for f in sorted(os.listdir(cat_dir))
+                    if f.lower().endswith(".glb")
+                ]
+                if glbs:
+                    index[cat_name] = glbs
+    else:
+        # Fallback recursive search if directory layout is non-standard
+        for base_dir in ["/kaggle/input", "../input", "."]:
+            if os.path.isdir(base_dir):
+                for dirpath, _, filenames in os.walk(base_dir, followlinks=True):
+                    cat_name = os.path.basename(dirpath).lower().strip()
+                    if cat_name in ("renders", "checkpoints", ".git", "__pycache__", "input", "kaggle", "datasets"):
+                        continue
+                    glbs = [
+                        os.path.realpath(os.path.join(dirpath, f))
+                        for f in sorted(filenames) if f.lower().endswith(".glb")
+                    ]
+                    if glbs:
+                        index[cat_name].extend(glbs)
+                if index:
+                    break
+
+    _DATASET_INDEX = dict(index)
+    return _DATASET_INDEX
+
+
 def get_categories():
     """Dynamically discover available categories from local CanoVerse GLB dataset."""
     global CATEGORIES
     if CATEGORIES:
         return CATEGORIES
         
-    cats = set()
-    pattern = "/kaggle/input/**/canoverse*/*"
-    dirs = glob.glob(pattern, recursive=True)
-    for d in dirs:
-        if os.path.isdir(d):
-            if glob.glob(os.path.join(d, "*.glb")):
-                cats.add(os.path.basename(d))
-    if not cats:
-        # Fallback wider search
-        glb_files = glob.glob("/kaggle/input/**/*.glb", recursive=True)
-        for f in glb_files:
-            cats.add(os.path.basename(os.path.dirname(f)))
-                
-    CATEGORIES = sorted(list(cats))
+    index = get_dataset_index()
+    CATEGORIES = sorted(list(index.keys()))
     
     if not CATEGORIES:
-        print("  [WARNING] No CanoVerse categories found at Kaggle path!")
+        print("  [WARNING] No CanoVerse categories found at dataset path!")
         raise ValueError("No categories found in dataset directory!")
     else:
         print(f"\n  [INFO] Dynamically discovered {len(CATEGORIES)} CanoVerse categories: {CATEGORIES}\n")
@@ -167,27 +243,52 @@ def get_categories():
     return CATEGORIES
 
 
+def sample_surface_points(geometry, n=5000):
+    """Uniformly sample n points from a Trimesh (area-weighted surface sampling) or PointCloud."""
+    if hasattr(geometry, 'faces') and geometry.faces is not None and len(geometry.faces) > 0:
+        try:
+            pts, _ = trimesh.sample.sample_surface(geometry, n)
+            return np.asarray(pts, dtype=np.float32)
+        except Exception:
+            pass
+    if hasattr(geometry, 'vertices') and len(geometry.vertices) > 0:
+        verts = np.asarray(geometry.vertices, dtype=np.float32)
+        if len(verts) <= n:
+            return verts
+        idx = np.random.choice(len(verts), n, replace=False)
+        return verts[idx]
+    return np.zeros((n, 3), dtype=np.float32)
+
+
 def load_mesh_or_pc(path):
-    """Load a CanoVerse .glb mesh with safe normal computation and vertex downsampling."""
+    """Load a CanoVerse .glb mesh with safe multi-geometry concatenation, normal computation and vertex cap."""
     # Load with skip_materials to avoid loading 4K textures into RAM.
-    # We must use process=True so trimesh merges duplicate vertices and
-    # computes valid face_normals, which are required by chamfer_distance()
-    # and support_vertical().
-    mesh = trimesh.load(path, force="mesh", skip_materials=True, process=True)
-    
-    # Cap extreme vertex counts to prevent OOM: for a 100K-vertex mesh,
-    # we re-derive the surface geometry from a uniform surface sample.
-    # This preserves surface shape and correct face normals at ~10MB instead of ~2GB.
+    loaded = trimesh.load(path, skip_materials=True, process=True)
+    if isinstance(loaded, trimesh.Scene):
+        # Concatenate submeshes into a single Trimesh preserving faces and topology
+        geoms = [g for g in loaded.geometry.values() if hasattr(g, 'vertices') and len(g.vertices) > 0]
+        if not geoms:
+            return trimesh.Trimesh()
+        mesh = trimesh.util.concatenate(geoms)
+    else:
+        mesh = loaded
+
+    # Cap extreme vertex counts to prevent OOM
     MAX_GLB_VERTS = 50_000
     if hasattr(mesh, 'vertices') and len(mesh.vertices) > MAX_GLB_VERTS:
-        pts, face_idx = trimesh.sample.sample_surface(mesh, MAX_GLB_VERTS)
-        if hasattr(mesh, 'face_normals') and len(mesh.face_normals) > 0:
-            normals = mesh.face_normals[face_idx]
+        if hasattr(mesh, 'faces') and len(mesh.faces) > 0:
+            try:
+                # Use quadric decimation to reduce polygon count while keeping faces intact
+                mesh = mesh.simplify_quadric_decimation(MAX_GLB_VERTS)
+            except Exception:
+                # Fallback: surface point sampling with normals
+                pts, face_idx = trimesh.sample.sample_surface(mesh, MAX_GLB_VERTS)
+                normals = mesh.face_normals[face_idx] if hasattr(mesh, 'face_normals') and len(mesh.face_normals) > 0 else np.zeros_like(pts)
+                mesh = trimesh.Trimesh(vertices=pts, vertex_normals=normals)
         else:
-            normals = np.zeros_like(pts)
-        # Rebuild as a point-cloud-like Trimesh so the rest of the pipeline works
-        mesh = trimesh.Trimesh(vertices=pts)
-        mesh.vertex_normals = normals
+            idx = np.random.choice(len(mesh.vertices), MAX_GLB_VERTS, replace=False)
+            mesh = trimesh.Trimesh(vertices=mesh.vertices[idx])
+            
     return mesh
 
 # Template axis conventions (paper Supp §1.1)
@@ -585,10 +686,20 @@ def model_summary(model):
 # GEOMETRY HELPERS
 # =====================================================================
 
+def rot_x(theta):
+    """Rotation matrix around the X axis by angle theta."""
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
+
 def rot_y(theta):
     """Rotation matrix around the Y (up) axis by angle theta."""
     c, s = np.cos(theta), np.sin(theta)
-    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float64)
+
+def rot_z(theta):
+    """Rotation matrix around the Z axis by angle theta."""
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
 
 def chordal_l2_mean_np(rotations):
     """Compute the chordal L2 mean of a list of numpy rotation matrices."""
@@ -602,10 +713,11 @@ def chordal_l2_mean_np(rotations):
     return S
 
 def rotation_angle_np(R1, R2):
-    """Geodesic angle (radians) between two numpy rotation matrices.
-    Uses ||R1-R2||_F = 2*sqrt(2)*sin(theta/2) which is exact near 0."""
-    d = np.sqrt(np.sum((R1 - R2) ** 2, axis=(-2, -1)) + 1e-24)
-    return 2.0 * np.arcsin(np.clip(d / (2.0 * np.sqrt(2.0)), a_min=None, a_max=1.0 - 1e-7))
+    """True geodesic angle (radians) between two numpy rotation matrices on SO(3)."""
+    R_rel = np.matmul(np.swapaxes(R1, -1, -2), R2)
+    trace = np.trace(R_rel, axis1=-2, axis2=-1)
+    trace = np.clip(trace, -1.0, 3.0)
+    return np.arccos(np.clip((trace - 1.0) / 2.0, -1.0, 1.0))
 
 
 def rodrigues_rotation(n_from, n_to):
@@ -669,6 +781,28 @@ def random_rotation_matrix():
     ], dtype=np.float32)
 
 
+def random_rotation_matrix_torch(device="cpu"):
+    """Sample a uniform random rotation from SO(3) directly as a PyTorch FloatTensor."""
+    u = torch.rand(3, device=device)
+    u1, u2, u3 = u[0], u[1], u[2]
+    pi2 = 2.0 * torch.pi
+
+    r1 = torch.sqrt(1.0 - u1)
+    r2 = torch.sqrt(u1)
+
+    w = r1 * torch.sin(pi2 * u2)
+    x = r1 * torch.cos(pi2 * u2)
+    y = r2 * torch.sin(pi2 * u3)
+    z = r2 * torch.cos(pi2 * u3)
+
+    R = torch.stack([
+        torch.stack([1.0 - 2.0*(y*y + z*z), 2.0*(x*y - w*z),       2.0*(x*z + w*y)]),
+        torch.stack([2.0*(x*y + w*z),       1.0 - 2.0*(x*x + z*z), 2.0*(y*z - w*x)]),
+        torch.stack([2.0*(x*z - w*y),       2.0*(y*z + w*x),       1.0 - 2.0*(x*x + y*y)]),
+    ])
+    return R
+
+
 def normalize_to_unit_sphere(mesh):
     """Centre mesh at geometric center and scale to fit inside a unit sphere.
     
@@ -688,34 +822,44 @@ def normalize_to_unit_sphere(mesh):
 
 
 def sample_points(mesh, n=None, seed=None, with_normals=False):
-    """Sample n points uniformly from the mesh surface or point cloud.
+    """Uniformly sample n surface points (with area weighting) + surface normals.
     
-    Args:
-        seed: If None, uses fresh random state (avoids train/test leakage).
-              If an int, uses deterministic seeding (for template reproducibility).
+    Uses exact face-area weighted triangle sampling so flat surfaces with few 
+    vertices (like large table tops) get proper point density.
     """
     if n is None:
         n = N_POINTS
-    st = np.random.get_state()
     if seed is not None:
+        st = np.random.get_state()
         np.random.seed(seed)
-    
-    has_normals = hasattr(mesh, "vertex_normals") and len(mesh.vertex_normals) > 0
-    
-    if hasattr(mesh, "faces") and len(mesh.faces) > 0:
-        pts, faces_idx = trimesh.sample.sample_surface(mesh, n)
-        if with_normals:
-            if hasattr(mesh, 'face_normals') and len(mesh.face_normals) > 0:
-                normals = mesh.face_normals[faces_idx]
+        
+    pts, normals = None, None
+    has_normals = hasattr(mesh, "vertex_normals") and mesh.vertex_normals is not None and len(mesh.vertex_normals) > 0
+    has_faces = hasattr(mesh, "faces") and mesh.faces is not None and len(mesh.faces) > 0
+
+    if has_faces:
+        try:
+            # Area-weighted surface sampling on triangle mesh
+            if with_normals:
+                pts, face_indices = trimesh.sample.sample_surface(mesh, n)
+                # Compute interpolated vertex normals or face normals
+                if hasattr(mesh, "face_normals") and len(mesh.face_normals) > 0:
+                    normals = mesh.face_normals[face_indices]
+                else:
+                    normals = np.zeros_like(pts)
             else:
-                normals = np.zeros_like(pts)
-    else:
-        pts = mesh.vertices
+                pts, _ = trimesh.sample.sample_surface(mesh, n)
+        except Exception:
+            pts = None
+
+    if pts is None:
+        # Fallback to direct vertex sampling if mesh is degenerate or point cloud
+        pts = np.asarray(mesh.vertices, dtype=np.float32)
         idx = None
-        if len(pts) > n:
+        if len(pts) >= n:
             idx = np.random.choice(len(pts), n, replace=False)
             pts = pts[idx]
-        elif len(pts) > 0 and len(pts) < n:
+        else:
             idx = np.random.choice(len(pts), n, replace=True)
             pts = pts[idx]
         
@@ -733,21 +877,39 @@ def sample_points(mesh, n=None, seed=None, with_normals=False):
     return np.asarray(pts, dtype=np.float32)
 
 
+@torch.no_grad()
 def chamfer_distance(a, b, na=None, nb=None, alpha=0.5):
-    """Chamfer distance between two point clouds (mean of nearest-neighbour dists).
-    Optional normal penalty: penalizes point matches with opposing normals.
-    """
-    ta, tb = cKDTree(a), cKDTree(b)
-    d_ab, idx_ab = tb.query(a)
-    d_ba, idx_ba = ta.query(b)
-    
-    cd_val = float(d_ab.mean() + d_ba.mean())
-    if na is not None and nb is not None:
-        dot_ab = np.sum(na * nb[idx_ab], axis=1)
-        dot_ba = np.sum(nb * na[idx_ba], axis=1)
-        normal_loss = float((1 - dot_ab).mean() + (1 - dot_ba).mean())
-        return cd_val + alpha * normal_loss
-    return cd_val
+    """Fast Chamfer distance with GPU acceleration, OOM safety, and optional normal penalty."""
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        a_t = torch.as_tensor(a, dtype=torch.float32, device=device)
+        b_t = torch.as_tensor(b, dtype=torch.float32, device=device)
+
+        dists = torch.cdist(a_t.unsqueeze(0), b_t.unsqueeze(0)).squeeze(0)
+        min_ab, idx_ab = dists.min(dim=1)
+        min_ba, idx_ba = dists.min(dim=0)
+        cd_val = float((min_ab.mean() + min_ba.mean()).item())
+
+        if na is not None and nb is not None:
+            na_t = torch.as_tensor(na, dtype=torch.float32, device=device)
+            nb_t = torch.as_tensor(nb, dtype=torch.float32, device=device)
+            dot_ab = (na_t * nb_t[idx_ab]).sum(dim=1)
+            dot_ba = (nb_t * na_t[idx_ba]).sum(dim=1)
+            normal_loss = float(((1.0 - dot_ab).mean() + (1.0 - dot_ba).mean()).item())
+            return cd_val + alpha * normal_loss
+        return cd_val
+    except (torch.cuda.OutOfMemoryError, RuntimeError):
+        # Fallback to CPU cKDTree if GPU VRAM is exhausted
+        ta, tb = cKDTree(a), cKDTree(b)
+        d_ab, idx_ab = tb.query(a)
+        d_ba, idx_ba = ta.query(b)
+        cd_val = float(d_ab.mean() + d_ba.mean())
+        if na is not None and nb is not None:
+            dot_ab = np.sum(na * nb[idx_ab], axis=1)
+            dot_ba = np.sum(nb * na[idx_ba], axis=1)
+            normal_loss = float((1.0 - dot_ab).mean() + (1.0 - dot_ba).mean())
+            return cd_val + alpha * normal_loss
+        return cd_val
 
 
 def chamfer_distance_fast(a, b, tree_b=None, max_pts=256):
@@ -973,8 +1135,7 @@ def support_vertical(mesh):
         # After the 50K vertex cap in load_mesh_or_pc, the mesh is face-stripped (point cloud only).
         # Calling sample_surface() on a face-stripped mesh throws an exception, which the broad
         # except below catches and returns np.eye(3) — silently disabling vertical alignment
-        # for ALL high-res GLB files. sample_points() handles both meshes and point clouds.
-        pts_sampled = sample_points(mesh, n=5000).astype(np.float64)
+        pts_sampled = sample_surface_points(mesh, n=5000).astype(np.float64)
         hull = trimesh.points.PointCloud(pts_sampled).convex_hull
     except Exception:
         # Fallback for genuinely degenerate meshes (e.g. <4 unique points)
@@ -1239,12 +1400,13 @@ def passes_quality(mesh):
 # RENDERING
 # =====================================================================
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
 def render_mesh_png(mesh, R, out_path):
     """Render a mesh under rotation R and save to out_path as PNG."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
     m = mesh.copy()
     T = np.eye(4)
@@ -1283,33 +1445,207 @@ def render_mesh_png(mesh, R, out_path):
     plt.close(fig)
 
 
-def render_to_pil(mesh, R):
-    """Render a mesh under rotation R and return as PIL Image (for CLIP)."""
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        tmp_path = f.name
-    try:
-        render_mesh_png(mesh, R, tmp_path)
-        img = Image.open(tmp_path).convert("RGB")
-        return img
-    finally:
+class MeshRenderer:
+    """Configurable 3D Mesh Renderer:
+    - Tier 1: Hardware-accelerated Z-buffered pyrender via EGL/OSMesa (~20ms/view on GPU).
+    - Tier 2: Vectorized matplotlib 3D fallback (0 external driver dependencies).
+    """
+
+    def __init__(self, render_size=RENDER_SIZE, use_pyrender=USE_PYRENDER):
+        self.render_size = render_size
+        self.use_pyrender = use_pyrender
+        self.backend = None
+        self._pyrenderer = None
+        self._pyrender = None
+        self._init_backend()
+
+    def __del__(self):
+        """Clean up Pyrender OpenGL context and GPU allocations."""
+        if self._pyrenderer is not None:
+            try:
+                self._pyrenderer.delete()
+            except Exception:
+                pass
+
+    def _init_backend(self):
+        if not self.use_pyrender:
+            self.backend = "matplotlib (CPU)"
+            print(f"  [Renderer] Using Matplotlib Renderer (USE_PYRENDER=False)")
+            return
+
+        # Test EGL / OSMesa in an isolated subprocess before initializing in main process
         try:
-            os.unlink(tmp_path)
-        except OSError:
+            import subprocess
+            for platform in ["egl", "osmesa"]:
+                cmd = (
+                    f"import os; os.environ['PYOPENGL_PLATFORM'] = '{platform}'; "
+                    f"import pyrender; r = pyrender.OffscreenRenderer(64, 64); r.delete()"
+                )
+                res = subprocess.run(
+                    [sys.executable, "-c", cmd],
+                    capture_output=True, timeout=5
+                )
+                if res.returncode == 0:
+                    os.environ["PYOPENGL_PLATFORM"] = platform
+                    import pyrender
+                    self._pyrender = pyrender
+                    self._pyrenderer = pyrender.OffscreenRenderer(
+                        viewport_width=self.render_size,
+                        viewport_height=self.render_size
+                    )
+                    self.backend = f"pyrender ({platform.upper()})"
+                    print(f"  [Renderer] Initialized Hardware Renderer: {self.backend}")
+                    return
+        except Exception:
             pass
+
+        self.backend = "matplotlib (CPU fallback)"
+        print("  [!] COULD NOT USE PYRENDER (EGL/OSMesa hardware rasterizer unavailable). Falling back to Tier-2 Matplotlib.")
+
+    def render(self, mesh, R):
+        if self._pyrenderer is not None:
+            try:
+                return self._render_pyrender(mesh, R)
+            except Exception:
+                pass
+        return self._render_matplotlib(mesh, R)
+
+    def _render_pyrender(self, mesh, R):
+        verts = (R @ np.asarray(mesh.vertices).T).T
+        verts = verts - verts.mean(axis=0)
+        faces = getattr(mesh, 'faces', None)
+        if faces is None or len(faces) == 0:
+            faces = np.zeros((0, 3), dtype=np.int64)
+
+        if len(faces) == 0:
+            return self._render_matplotlib(mesh, R)
+
+        mesh_oriented = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        material = self._pyrender.MetallicRoughnessMaterial(
+            baseColorFactor=[0.55, 0.60, 0.68, 1.0],
+            roughnessFactor=0.6,
+            metallicFactor=0.1
+        )
+        py_mesh = self._pyrender.Mesh.from_trimesh(mesh_oriented, material=material, smooth=True)
+
+        scene = self._pyrender.Scene(
+            bg_color=[1.0, 1.0, 1.0, 1.0],
+            ambient_light=[0.45, 0.45, 0.45]
+        )
+        scene.add(py_mesh)
+
+        max_extent = float(np.abs(verts).max() * 1.1 + 1e-4)
+        fov_y = np.pi / 3.0
+        dist = max_extent / np.tan(fov_y / 2.0)
+
+        camera = self._pyrender.PerspectiveCamera(yfov=fov_y)
+        cam_pose = np.array([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, dist],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
+        scene.add(camera, pose=cam_pose)
+
+        # Key light (offset top-right for depth cues and realistic geometric shading)
+        key_light = self._pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=2.0)
+        light_pose = np.array([
+            [1.0, 0.0, 0.0, dist * 0.4],
+            [0.0, 1.0, 0.0, dist * 0.6],
+            [0.0, 0.0, 1.0, dist * 0.8],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
+        scene.add(key_light, pose=light_pose)
+
+        color, _ = self._pyrenderer.render(scene)
+        return Image.fromarray(color)
+
+    def _render_matplotlib(self, mesh, R):
+        verts = (R @ np.asarray(mesh.vertices).T).T
+        verts = verts - verts.mean(axis=0)
+        faces = getattr(mesh, 'faces', None)
+        if faces is None or len(faces) == 0:
+            faces = np.zeros((0, 3), dtype=np.int64)
+
+        fig = plt.figure(figsize=(self.render_size / 100, self.render_size / 100), dpi=100)
+        try:
+            ax = fig.add_subplot(111, projection="3d")
+            if len(faces) > 0:
+                tris = verts[faces]
+                light = np.array([0.3, 0.75, 0.6])
+                light = light / np.linalg.norm(light)
+                normals = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+                nlen = np.linalg.norm(normals, axis=1, keepdims=True)
+                nlen[nlen == 0] = 1
+                normals = normals / nlen
+                shade = np.clip(np.abs(normals @ light), 0.0, 1.0) * 0.7 + 0.3
+                base = np.array([0.55, 0.60, 0.68])
+                facecolors = np.clip(shade[:, None] * base[None, :], 0, 1)
+                coll = Poly3DCollection(tris, facecolors=facecolors, edgecolors="none")
+                ax.add_collection3d(coll)
+            else:
+                ax.scatter(verts[:, 0], verts[:, 1], verts[:, 2], s=1, c='gray', depthshade=True)
+
+            lim = float(np.abs(verts).max() * 1.05 + 1e-6)
+            ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_zlim(-lim, lim)
+            ax.set_box_aspect((1, 1, 1))
+            ax.view_init(elev=0, azim=0)
+            ax.set_axis_off()
+            fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", transparent=False, facecolor="white")
+            buf.seek(0)
+            img = Image.open(buf).convert("RGB").copy()
+            buf.close()
+            return img
+        finally:
+            plt.close(fig)
+
+
+# Singleton renderer instance with thread-safe lock
+_RENDERER_LOCK = threading.Lock()
+_GLOBAL_RENDERER = None
+
+def get_mesh_renderer():
+    global _GLOBAL_RENDERER
+    if _GLOBAL_RENDERER is None:
+        with _RENDERER_LOCK:
+            if _GLOBAL_RENDERER is None:
+                _GLOBAL_RENDERER = MeshRenderer(render_size=RENDER_SIZE)
+    return _GLOBAL_RENDERER
+
+def render_to_pil(mesh, R):
+    """Render a mesh under rotation R directly to a PIL Image."""
+    renderer = get_mesh_renderer()
+    return renderer.render(mesh, R)
 
 
 # =====================================================================
 # CLIP-BASED CATEGORY DISCOVERY  (Uni3D proxy — paper §3.1)
 # =====================================================================
 
+def _extract_tensor(feats):
+    """Safely unwrap torch.Tensor from transformers ModelOutput or BaseModelOutputWithPooling."""
+    if isinstance(feats, torch.Tensor):
+        return feats
+    if hasattr(feats, "text_embeds") and feats.text_embeds is not None:
+        return feats.text_embeds
+    if hasattr(feats, "image_embeds") and feats.image_embeds is not None:
+        return feats.image_embeds
+    if hasattr(feats, "pooler_output") and feats.pooler_output is not None:
+        return feats.pooler_output
+    if hasattr(feats, "last_hidden_state") and feats.last_hidden_state is not None:
+        return feats.last_hidden_state[:, 0]
+    return feats[0]
+
+
 class CategoryDiscovery:
-    """Zero-shot category identification using multi-view CLIP.
+    """Zero-shot category identification using multi-view CLIP on GPU.
 
-    The paper uses Uni3D for category identification.  We approximate this
-    with a multi-view CLIP approach (render from 4 viewpoints, average CLIP
-    scores against "a 3D model of a [category]" text prompts).
-
-    Uses HuggingFace `transformers` CLIPModel (pre-installed on Kaggle).
+    Approximates Uni3D by rendering objects from multiple azimuth and elevation
+    perspectives, extracting normalized image features, and scoring against
+    pre-cached category text embeddings with logit temperature scaling.
     """
 
     def __init__(self, categories=None, model_name=None):
@@ -1318,12 +1654,12 @@ class CategoryDiscovery:
         if model_name is None:
             model_name = CLIP_MODEL_NAME
         
-        print("Initializing CLIP Model...")
-        print("Categories: ", categories)
         self.categories = list(categories)
         self.model_name = model_name
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._model = None
         self._processor = None
+        self._text_features = None
         self._available = True
 
     def _load(self):
@@ -1332,41 +1668,56 @@ class CategoryDiscovery:
         try:
             from transformers import CLIPModel, CLIPProcessor
             self._processor = CLIPProcessor.from_pretrained(self.model_name)
-            self._model = CLIPModel.from_pretrained(self.model_name)
+            self._model = CLIPModel.from_pretrained(self.model_name).to(self.device)
             self._model.eval()
-            print(f"  [CLIP] Loaded {self.model_name}")
+            
+            # Pre-encode static normalized text features on GPU once
+            prompts = [f"a 3D model of a {cat.replace('_', ' ')}" for cat in self.categories]
+            text_inputs = self._processor(text=prompts, return_tensors="pt", padding=True)
+            text_inputs = {k: v.to(self.device) for k, v in text_inputs.items()}
+            with torch.no_grad():
+                text_feats = self._model.get_text_features(**text_inputs)
+                text_feats = _extract_tensor(text_feats)
+                self._text_features = F.normalize(text_feats, dim=-1)  # (N_cats, D)
+                
+            print(f"  [CLIP] Loaded {self.model_name} on {self.device} (cached {len(self.categories)} category embeddings)")
         except Exception as e:
             print(f"  [!] CLIP unavailable ({e}). Category discovery disabled.")
             self._available = False
 
-    def identify(self, mesh, n_views=4):
+    def identify(self, mesh, n_views=8):
         """Identify the category of a 3D mesh via multi-view CLIP.
 
         Returns:
-            (category_name, confidence, all_scores_dict)
+            (category_name, confidence, all_scores_dict) or (None, 0.0, {})
         """
         self._load()
-        if not self._available:
-            return self.categories[0], 0.0, {}
+        if not self._available or self._model is None or self._text_features is None:
+            return None, 0.0, {}
 
-        # Render from multiple viewpoints
+        # 8 multi-view camera perspectives combining horizontal and elevated angles
+        VIEW_ANGLES = [
+            (0, 0), (90, 0), (180, 0), (270, 0),        # 4 horizontal views
+            (45, 30), (135, 30), (225, 30), (315, 30),  # 4 elevated 30° views
+        ]
         images = []
-        for az_deg in np.linspace(0, 360, n_views, endpoint=False):
-            R = rot_y(np.radians(az_deg))
+        for az, el in VIEW_ANGLES[:n_views]:
+            R = rot_y(np.radians(az)) @ rot_x(np.radians(el))
             img = render_to_pil(mesh, R)
             images.append(img)
 
-        # CLIP inference
-        text_prompts = [f"a 3D model of a {cat}" for cat in self.categories]
-        inputs = self._processor(
-            text=text_prompts, images=images, return_tensors="pt", padding=True
-        )
+        image_inputs = self._processor(images=images, return_tensors="pt")
+        image_inputs = {k: v.to(self.device) for k, v in image_inputs.items()}
+
         with torch.no_grad():
-            outputs = self._model(**inputs)
-            # logits_per_image: (n_views, n_categories)
-            logits = outputs.logits_per_image
-            avg_logits = logits.mean(dim=0)  # (n_categories,)
-            probs = torch.softmax(avg_logits, dim=0)
+            image_feats = self._model.get_image_features(**image_inputs)
+            image_feats = _extract_tensor(image_feats)
+            image_feats = F.normalize(image_feats, dim=-1)
+            avg_feat = image_feats.mean(dim=0, keepdim=True)  # (1, D)
+
+            logit_scale = self._model.logit_scale.exp()
+            scores = (logit_scale * (avg_feat @ self._text_features.T)).squeeze(0)
+            probs = torch.softmax(scores, dim=0)
 
         best_idx = int(probs.argmax().item())
         scores_dict = {cat: float(p) for cat, p in zip(self.categories, probs.tolist())}
@@ -1378,21 +1729,16 @@ class CategoryDiscovery:
 # =====================================================================
 
 def load_category_uids(category, n_needed=None, verbose=True):
-    """Fetch .glb object file paths from local CanoVerse dataset."""
-    pattern = "/kaggle/input/**/canoverse*/*/*.glb"
-    all_files = glob.glob(pattern, recursive=True)
-    if not all_files:
-        all_files = glob.glob("/kaggle/input/**/*.glb", recursive=True)
-        
-    selected_files = []
-    cat_lower = category.lower()
-    for file_path in all_files:
-        parent_dir = os.path.basename(os.path.dirname(file_path)).lower()
-        if parent_dir == cat_lower or parent_dir.startswith(f"{cat_lower}_"):
-            selected_files.append(file_path)
-            if n_needed is not None and len(selected_files) >= n_needed:
-                break
-            
+    """Fetch .glb object file paths for an EXACT category name from local CanoVerse dataset."""
+    index = get_dataset_index()
+    cat_key = category.lower().strip()
+    files = index.get(cat_key, [])
+
+    if n_needed is not None:
+        selected_files = files[:n_needed]
+    else:
+        selected_files = list(files)
+
     if verbose:
         print(f"  Found {len(selected_files)} '{category}' objects in CanoVerse.")
     return selected_files
@@ -1437,22 +1783,50 @@ def download_objects(uids):
 # SELF-SUPERVISED LABELING
 # =====================================================================
 
+@torch.no_grad()
 def compute_auto_label(candidate_pts_list, template_pts, candidate_normals_list=None, template_normals=None):
-    """Pick candidate with lowest Chamfer distance to template (self-supervised)."""
-    distances = []
-    for i, cpts in enumerate(candidate_pts_list):
-        cn = candidate_normals_list[i] if candidate_normals_list else None
-        d = chamfer_distance(cpts, template_pts, na=cn, nb=template_normals)
-        distances.append(d)
-    return int(np.argmin(distances)), distances
+    """Pick candidate with lowest Chamfer distance to template in a single batched GPU kernel."""
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        cands_t = torch.tensor(np.stack(candidate_pts_list), dtype=torch.float32, device=device)  # (5, N, 3)
+        tpl_t = torch.tensor(template_pts, dtype=torch.float32, device=device).unsqueeze(0)        # (1, N, 3)
+
+        # Compute pairwise distance for all 5 candidates in parallel: (5, N_cand, N_tpl)
+        dists = torch.cdist(cands_t, tpl_t)  # (5, N_cand, N_tpl)
+        min_c2t, idx_c2t = dists.min(dim=2)  # (5, N_cand)
+        min_t2c, idx_t2c = dists.min(dim=1)  # (5, N_tpl)
+
+        cd_vals = (min_c2t.mean(dim=1) + min_t2c.mean(dim=1))  # (5,)
+
+        if candidate_normals_list and template_normals is not None:
+            cn_t = torch.tensor(np.stack(candidate_normals_list), dtype=torch.float32, device=device)  # (5, N, 3)
+            tn_t = torch.tensor(template_normals, dtype=torch.float32, device=device)                   # (N, 3)
+
+            tn_matched = tn_t[idx_c2t]  # (5, N, 3)
+            dot_c2t = (cn_t * tn_matched).sum(dim=-1)  # (5, N)
+
+            cn_matched = torch.gather(cn_t, 1, idx_t2c.unsqueeze(-1).expand(-1, -1, 3))  # (5, N, 3)
+            dot_t2c = (tn_t.unsqueeze(0) * cn_matched).sum(dim=-1)  # (5, N)
+
+            normal_loss = (1.0 - dot_c2t).mean(dim=1) + (1.0 - dot_t2c).mean(dim=1)
+            cd_vals = cd_vals + 0.5 * normal_loss
+
+        distances = cd_vals.tolist()
+        best_idx = int(cd_vals.argmin().item())
+        return best_idx, distances
+    except (torch.cuda.OutOfMemoryError, RuntimeError):
+        # Fallback to serial CPU Chamfer distance if GPU memory is exhausted
+        distances = []
+        for i, cpts in enumerate(candidate_pts_list):
+            cn = candidate_normals_list[i] if candidate_normals_list else None
+            d = chamfer_distance(cpts, template_pts, na=cn, nb=template_normals)
+            distances.append(d)
+        return int(np.argmin(distances)), distances
 
 
 # =====================================================================
 # PYTORCH DATASETS
 # =====================================================================
-
-
-
 
 class AgnosticRankingDataset(Dataset):
     """Cross-category ranking dataset for category-agnostic training.
@@ -1464,12 +1838,12 @@ class AgnosticRankingDataset(Dataset):
 
     Supports SO(3) rotation augmentation and per-object category index.
     """
-    def __init__(self, all_category_data, augment=False, n_rotations=None):
+    def __init__(self, all_category_data, augment=False, n_rotations=None, category_to_idx=None):
         if n_rotations is None:
             n_rotations = N_ROTATIONS
         self.augment = augment
         self.n_rotations = n_rotations if augment else 1
-        self.category_to_idx = {}
+        self.category_to_idx = dict(category_to_idx) if category_to_idx is not None else {}
         
         templates = []
         candidates = []
@@ -1484,8 +1858,11 @@ class AgnosticRankingDataset(Dataset):
             tpl = torch.tensor(cat_data["template_pts"], dtype=torch.float32)
 
             for obj in cat_data["objects"]:
+                cands = obj.get("candidate_pts", [])
+                if len(cands) != 5:
+                    continue  # Guard against malformed or incomplete candidate sets
                 cand_pts = torch.stack([
-                    torch.tensor(obj["candidate_pts"][i], dtype=torch.float32)
+                    torch.tensor(cands[i], dtype=torch.float32)
                     for i in range(5)
                 ])  # (5, N_POINTS, 3)
                 
@@ -1521,7 +1898,7 @@ class AgnosticRankingDataset(Dataset):
         category_idx = self.category_idxs[item_idx]
 
         if self.augment and self.n_rotations > 1:
-            R = torch.tensor(random_rotation_matrix(), dtype=torch.float32)
+            R = random_rotation_matrix_torch()
             template = template @ R.T
             candidates = candidates @ R.T  # (5, N, 3) @ (3, 3) broadcasts correctly
 
@@ -1558,8 +1935,12 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
 
     needed = (n_objects + 1) if (USE_ONLY_N_SAMPLES and n_objects is not None) else None
     uids = load_category_uids(category, (needed + 50) if needed else None)
-    if len(uids) < 2:
-        raise RuntimeError(f"Only found {len(uids)} '{category}' objects. Need >= 2.")
+    if len(uids) == 0:
+        print(f"  [!] Warning: No objects found for category '{category}'. Skipping.")
+        return None
+    elif len(uids) == 1:
+        print(f"  [!] Note: Only 1 '{category}' object found. Duplicating to satisfy minimum requirements.")
+        uids = [uids[0], uids[0]]
 
     random.shuffle(uids)
 
@@ -1568,8 +1949,8 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
     objs = download_objects(download_uids)
 
     # print("\n  Setting up canonical template (Medoid Selection)...")
-    # Evaluate first 15 objects to find the "most average" (medoid) template
-    num_medoid_cands = min(15, len(uids))
+    # Evaluate first 12 objects to find the "most average" (medoid) template
+    num_medoid_cands = min(12, len(uids))
     medoid_pts_list = []
     medoid_uids = uids[:num_medoid_cands]
     
@@ -1580,16 +1961,41 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
         pts = sample_points(m, seed=42, with_normals=False)
         medoid_pts_list.append((uid, pts))
         
-    best_medoid_uid = medoid_uids[0]
-    best_medoid_score = float('inf')
-    for i, (uid_i, pts_i) in enumerate(medoid_pts_list):
-        score = 0
-        for j, (uid_j, pts_j) in enumerate(medoid_pts_list):
-            if i != j:
-                score += chamfer_distance(pts_i, pts_j)
-        if score < best_medoid_score:
-            best_medoid_score = score
-            best_medoid_uid = uid_i
+    # GPU-accelerated pairwise medoid selection (OOM-safe: only 1 pair in VRAM at a time < 1MB)
+    if len(medoid_pts_list) > 1:
+        try:
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            pts_tensor = torch.tensor(
+                np.stack([item[1] for item in medoid_pts_list]),
+                dtype=torch.float32,
+                device=dev
+            )  # (K, N, 3)
+            K = len(medoid_pts_list)
+            scores = torch.zeros(K, device=dev)
+            with torch.no_grad():
+                for i in range(K):
+                    for j in range(i + 1, K):
+                        dists = torch.cdist(pts_tensor[i:i+1], pts_tensor[j:j+1]).squeeze(0)  # (N, N) ~ 4MB VRAM
+                        cd = (dists.min(dim=1).values.mean() + dists.min(dim=0).values.mean()).item()
+                        scores[i] += cd
+                        scores[j] += cd
+            best_medoid_uid = medoid_pts_list[scores.argmin().item()][0]
+        except (torch.cuda.OutOfMemoryError, RuntimeError):
+            # Fallback to CPU if GPU runs out of memory
+            best_medoid_score = float('inf')
+            best_medoid_uid = medoid_pts_list[0][0]
+            for i, (uid_i, pts_i) in enumerate(medoid_pts_list):
+                score = 0
+                for j, (uid_j, pts_j) in enumerate(medoid_pts_list):
+                    if i != j:
+                        score += chamfer_distance(pts_i, pts_j)
+                if score < best_medoid_score:
+                    best_medoid_score = score
+                    best_medoid_uid = uid_i
+    elif len(medoid_pts_list) == 1:
+        best_medoid_uid = medoid_pts_list[0][0]
+    else:
+        best_medoid_uid = medoid_uids[0]
 
     template_uid = best_medoid_uid
     tpl_path = objs.get(template_uid)
@@ -1894,7 +2300,8 @@ def train_agnostic(categories=None):
     all_data = []
     for cat in categories:
         data = prepare_training_data(cat)
-        all_data.append(data)
+        if data is not None:
+            all_data.append(data)
 
     # ---- Split per-category, then pool ----
     train_cat_data, val_cat_data, test_cat_data = [], [], []
@@ -1913,8 +2320,8 @@ def train_agnostic(categories=None):
 
     # ---- Build datasets ----
     train_ds = AgnosticRankingDataset(train_cat_data, augment=True, n_rotations=N_ROTATIONS)
-    val_ds = AgnosticRankingDataset(val_cat_data, augment=False)
-    test_ds = AgnosticRankingDataset(test_cat_data, augment=False)
+    val_ds = AgnosticRankingDataset(val_cat_data, augment=False, category_to_idx=train_ds.category_to_idx)
+    test_ds = AgnosticRankingDataset(test_cat_data, augment=False, category_to_idx=train_ds.category_to_idx)
 
     n_cats = len(train_ds.category_to_idx)
     print(f"\n  Total train samples: {len(train_ds)} ({len(train_ds)//N_ROTATIONS} base × {N_ROTATIONS} aug)")
@@ -1922,15 +2329,18 @@ def train_agnostic(categories=None):
     print(f"  Total test samples:  {len(test_ds)}")
     print(f"  Category count:      {n_cats}")
 
+    num_workers = 2 if (os.name != 'nt' and torch.cuda.is_available()) else 0
+    use_persistent = (num_workers > 0)
+
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=2, pin_memory=(device.type == "cuda"),
-                              persistent_workers=True)
+                              num_workers=num_workers, pin_memory=(device.type == "cuda"),
+                              persistent_workers=use_persistent)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE * 2, shuffle=False,
-                            num_workers=2, pin_memory=(device.type == "cuda"),
-                            persistent_workers=True)
+                            num_workers=num_workers, pin_memory=(device.type == "cuda"),
+                            persistent_workers=use_persistent)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE * 2, shuffle=False,
-                             num_workers=2, pin_memory=(device.type == "cuda"),
-                             persistent_workers=True)
+                             num_workers=num_workers, pin_memory=(device.type == "cuda"),
+                             persistent_workers=use_persistent)
 
     # ---- Build model ----
     model = VNCandidateSelector(
@@ -2063,7 +2473,7 @@ def train_agnostic(categories=None):
     print("\n  Per-Category Breakdown:")
     for cat_data_entry in test_cat_data:
         cat = cat_data_entry["category"]
-        cat_ds = AgnosticRankingDataset([cat_data_entry], augment=False)
+        cat_ds = AgnosticRankingDataset([cat_data_entry], augment=False, category_to_idx=train_ds.category_to_idx)
         if len(cat_ds) == 0:
             continue
         cat_loader = DataLoader(cat_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
@@ -2225,7 +2635,7 @@ def align_single_object(mesh_or_path, template_mesh_or_pts=None, category=None):
       1. Load mesh if path is given
       2. Auto-detect category via CLIP (if no category specified)
       3. Generate 5 candidate rotations
-      4. Score with best available VNN (agnostic → per-category → Chamfer fallback)
+      4. Score with best available VNN (agnostic → Chamfer fallback)
       5. Return (best_rotation, candidate_name, candidate_index)
     """
     # ---- Load mesh ----
@@ -2238,6 +2648,8 @@ def align_single_object(mesh_or_path, template_mesh_or_pts=None, category=None):
     if category is None:
         discovery = CategoryDiscovery()
         category, confidence, all_scores = discovery.identify(mesh)
+        if category is None:
+            raise ValueError("Zero-shot CLIP category discovery was unavailable or failed.")
         print(f"  Auto-detected category: {category} (confidence: {confidence:.2f})")
         if all_scores:
             top3 = sorted(all_scores.items(), key=lambda x: -x[1])[:3]
