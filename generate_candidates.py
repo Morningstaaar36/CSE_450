@@ -7,7 +7,7 @@ Complete self-contained pipeline for training and using a Vector Neuron
 Network (VNN) for automatic canonical orientation selection of 3D objects.
 
 Implements the full CanoVerse paper method:
-  - Semantic part segmentation (K-means spatial clustering as Find3D proxy)
+  - Semantic part segmentation (Sparse Spectral Graph Decomposition as Find3D proxy)
   - Proper support-surface vertical alignment (Rodrigues rotation + stability)
   - PCA vertical with semantic part disambiguation (Eq. 1-2)
   - Joint semantic-geometric horizontal alignment (Eq. 4)
@@ -53,36 +53,6 @@ MIN_GLBS_TO_RENDER = 100    # Each category chosen for rendering must contain at
 # Point cloud settings
 N_POINTS = 1024          # Points sampled per mesh surface (consistent everywhere)
 
-
-def get_categories():
-    """Dynamically discover available categories from local CanoVerse GLB dataset."""
-    global CATEGORIES
-    if CATEGORIES:
-        return CATEGORIES
-        
-    cats = set()
-    pattern = "/kaggle/input/**/canoverse*/*"
-    dirs = glob.glob(pattern, recursive=True)
-    for d in dirs:
-        if os.path.isdir(d):
-            if glob.glob(os.path.join(d, "*.glb")):
-                cats.add(os.path.basename(d))
-    if not cats:
-        # Fallback wider search
-        glb_files = glob.glob("/kaggle/input/**/*.glb", recursive=True)
-        for f in glb_files:
-            cats.add(os.path.basename(os.path.dirname(f)))
-                
-    CATEGORIES = sorted(list(cats))
-    
-    if not CATEGORIES:
-        print("  [WARNING] No CanoVerse categories found at Kaggle path!")
-        raise ValueError("No categories found in dataset directory!")
-    else:
-        print(f"\n  [INFO] Dynamically discovered {len(CATEGORIES)} CanoVerse categories: {CATEGORIES}\n")
-        
-    return CATEGORIES
-
 # Rotation augmentation: 3 rotations is sufficient since VN-DGCNN is already equivariant,
 # so augmentation is mainly for regularization, not for teaching invariance.
 N_ROTATIONS = 3
@@ -111,8 +81,9 @@ TEST_RATIO = 0.15
 THETA_STEPS = 72         # Horizontal rotation search resolution (was 180; 5-deg steps still precise)
 RENDER_SIZE = 320        # Render image dimensions (pixels, square)
 
-# Semantic part segmentation
-N_SEMANTIC_PARTS = 6     # Number of spatial-semantic clusters
+# Semantic part segmentation (Sparse Spectral Graph Decomposition)
+N_SEMANTIC_PARTS = 6          # Number of semantic part clusters
+CENTROID_MATCH_WEIGHT = 0.2   # Weight balancing Chamfer distance vs spatial centroid alignment in Hungarian matching
 
 # Quality gate
 MIN_THICKNESS_RATIO = 0.02
@@ -146,6 +117,7 @@ import time
 import tempfile
 import glob
 import math
+import threading
 
 import numpy as np
 import torch
@@ -155,12 +127,45 @@ import torch.optim as optim
 !pip -q install trimesh
 import trimesh
 from PIL import Image
+from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree, ConvexHull
+from scipy.sparse import csr_matrix, eye as speye
+from scipy.sparse.linalg import eigsh
 from sklearn.cluster import MiniBatchKMeans
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 os.environ.pop("PYOPENGL_PLATFORM", None)
+
+def get_categories():
+    """Dynamically discover available categories from local CanoVerse GLB dataset."""
+    global CATEGORIES
+    if CATEGORIES:
+        return CATEGORIES
+        
+    cats = set()
+    pattern = "/kaggle/input/**/canoverse*/*"
+    dirs = glob.glob(pattern, recursive=True)
+    for d in dirs:
+        if os.path.isdir(d):
+            if glob.glob(os.path.join(d, "*.glb")):
+                cats.add(os.path.basename(d))
+    if not cats:
+        # Fallback wider search
+        glb_files = glob.glob("/kaggle/input/**/*.glb", recursive=True)
+        for f in glb_files:
+            cats.add(os.path.basename(os.path.dirname(f)))
+                
+    CATEGORIES = sorted(list(cats))
+    
+    if not CATEGORIES:
+        print("  [WARNING] No CanoVerse categories found at Kaggle path!")
+        raise ValueError("No categories found in dataset directory!")
+    else:
+        print(f"\n  [INFO] Dynamically discovered {len(CATEGORIES)} CanoVerse categories: {CATEGORIES}\n")
+        
+    return CATEGORIES
+
 
 def load_mesh_or_pc(path):
     """Load a CanoVerse .glb mesh with safe normal computation and vertex downsampling."""
@@ -811,69 +816,135 @@ def point_in_polygon_2d(point, polygon):
 
 
 # =====================================================================
-# SEMANTIC PART SEGMENTATION  (Find3D proxy — paper §3.1)
+# SPECTRAL GEOMETRIC PART SEGMENTATION (Self-Contained & Fast)
 # =====================================================================
 
-def segment_semantic_parts(points, n_parts=None):
-    """Segment a point cloud into spatial-semantic parts via MiniBatch K-means clustering.
-
-    MiniBatchKMeans is 3-10x faster than kmeans2 on 1024 points while producing
-    essentially the same cluster quality for spatial segmentation.
-
-    Returns a list of point-cloud arrays, one per cluster.
+class SpectralPartSegmenter:
+    """Thread-safe sparse spectral graph decomposition for 3D part segmentation.
+    
+    Computes normalized Graph Laplacian eigenvectors (harmonic eigenfunctions)
+    combined with multi-scale spatial coordinates to partition point clouds into
+    smooth, topologically continuous parts. Completely self-contained and fast.
     """
+    _instance = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = SpectralPartSegmenter()
+        return cls._instance
+
+    def compute_features(self, points, k_neighbors=16, n_components=6):
+        """Compute fast, deterministic, sparse geometric spectral features (Laplacian eigenvectors + spatial coordinates).
+        
+        Uses sparse matrix operations (csr_matrix and ARPACK eigsh) for O(N*k) computational
+        complexity and O(N*k) memory, scaling efficiently to large point clouds.
+        """
+        N = len(points)
+        if N < 8:
+            return points
+            
+        tree = cKDTree(points)
+        k_eff = min(k_neighbors, N - 1)
+        dists, indices = tree.query(points, k=k_eff + 1)
+        
+        sigma = np.median(dists[:, 1:]) + 1e-6
+        rows = np.repeat(np.arange(N), k_eff)
+        cols = indices[:, 1:].flatten()
+        weights = np.exp(-(dists[:, 1:].flatten() ** 2) / (2 * sigma ** 2))
+        
+        W = csr_matrix((weights, (rows, cols)), shape=(N, N), dtype=np.float32)
+        W = 0.5 * (W + W.T)
+        
+        deg = np.array(W.sum(axis=1)).flatten() + 1e-7
+        inv_sqrt_deg = 1.0 / np.sqrt(deg)
+        D_inv_sqrt = csr_matrix((inv_sqrt_deg, (np.arange(N), np.arange(N))), shape=(N, N), dtype=np.float32)
+        
+        L_sym = speye(N, dtype=np.float32, format='csr') - D_inv_sqrt @ W @ D_inv_sqrt
+        
+        n_comp = min(n_components, max(1, N - 2))
+        try:
+            evals, evecs = eigsh(L_sym, k=n_comp + 1, which='SM', tol=1e-3, maxiter=200)
+            spectral_emb = evecs[:, 1:n_comp + 1]
+        except Exception:
+            spectral_emb = np.zeros((N, n_comp), dtype=np.float32)
+
+        center = points.mean(axis=0)
+        norm_coords = (points - center) / (np.linalg.norm(points - center, axis=1).max() + 1e-8)
+        radius = np.linalg.norm(norm_coords, axis=1, keepdims=True)
+        
+        return np.concatenate([norm_coords, radius, spectral_emb], axis=-1).astype(np.float32)
+
+    def segment(self, points, n_parts=N_SEMANTIC_PARTS):
+        """Segment point cloud into semantic parts using Sparse Spectral Graph Decomposition."""
+        if len(points) < n_parts or n_parts <= 1:
+            return [points]
+
+        effective_n_parts = min(n_parts, max(1, len(points) // 4))
+        combined_rep = self.compute_features(points, n_components=effective_n_parts)
+
+        try:
+            km = MiniBatchKMeans(
+                n_clusters=effective_n_parts,
+                n_init=3,
+                max_iter=100,
+                batch_size=min(256, len(points)),
+                random_state=RANDOM_SEED,
+            )
+            labels = km.fit_predict(combined_rep)
+        except Exception:
+            split_dim = int(np.argmax(np.ptp(points, axis=0)))
+            edges = np.linspace(points[:, split_dim].min(), points[:, split_dim].max(), effective_n_parts + 1)
+            labels = np.clip(np.digitize(points[:, split_dim], edges[1:-1]), 0, effective_n_parts - 1)
+
+        parts = []
+        for k in range(effective_n_parts):
+            mask = labels == k
+            if mask.sum() > 0:
+                parts.append(points[mask])
+                
+        return parts if parts else [points]
+
+
+def segment_semantic_parts(points, n_parts=None):
+    """Segment a point cloud into semantic parts via Spectral Graph Decomposition."""
     if n_parts is None:
         n_parts = N_SEMANTIC_PARTS
-    n_parts = min(n_parts, max(1, len(points) // 4))
-    if n_parts <= 1:
-        return [points]
-    try:
-        km = MiniBatchKMeans(
-            n_clusters=n_parts,
-            n_init=1,
-            max_iter=50,
-            batch_size=min(256, len(points)),
-            random_state=RANDOM_SEED,
-        )
-        labels = km.fit_predict(points.astype(np.float32))
-    except Exception:
-        # Fallback: uniform spatial binning along the longest axis
-        axis = int(np.argmax(np.ptp(points, axis=0)))
-        edges = np.linspace(points[:, axis].min(), points[:, axis].max(), n_parts + 1)
-        labels = np.clip(np.digitize(points[:, axis], edges[1:-1]), 0, n_parts - 1)
-
-    parts = []
-    for k in range(n_parts):
-        mask = labels == k
-        if mask.sum() > 0:
-            parts.append(points[mask])
-    return parts if parts else [points]
+    return SpectralPartSegmenter.get_instance().segment(points, n_parts=n_parts)
 
 
-def match_parts_chamfer(parts_a, parts_b, max_pts=256):
-    """Match two sets of semantic parts by greedy nearest-centroid and return
-    the average per-part fast Chamfer distance.
+def match_parts_chamfer(parts_a, parts_b, max_pts=256, centroid_weight=CENTROID_MATCH_WEIGHT):
+    """Match two sets of semantic parts using optimal bipartite matching (Hungarian algorithm)
+    and return the average per-part Chamfer distance.
+    
+    Args:
+        centroid_weight: Weight balancing local per-part Chamfer distance with global spatial centroid alignment.
     """
     if not parts_a or not parts_b:
         return float("inf")
+        
+    na, nb = len(parts_a), len(parts_b)
+    cost_matrix = np.zeros((na, nb), dtype=np.float32)
+    
     centroids_a = [p.mean(axis=0) for p in parts_a]
     centroids_b = [p.mean(axis=0) for p in parts_b]
-    used_b = set()
-    total_cd = 0.0
-    m = 0
-    for i, ca in enumerate(centroids_a):
-        best_j, best_dist = -1, float("inf")
-        for j, cb in enumerate(centroids_b):
-            if j in used_b:
-                continue
-            d = float(np.linalg.norm(ca - cb))
-            if d < best_dist:
-                best_dist, best_j = d, j
-        if best_j >= 0:
-            used_b.add(best_j)
-            total_cd += chamfer_distance_fast(parts_a[i], parts_b[best_j], max_pts=max_pts)
-            m += 1
-    return total_cd / m if m > 0 else float("inf")
+    
+    for i in range(na):
+        for j in range(nb):
+            cd = chamfer_distance_fast(parts_a[i], parts_b[j], max_pts=max_pts)
+            cent_dist = np.linalg.norm(centroids_a[i] - centroids_b[j])
+            cost_matrix[i, j] = cd + centroid_weight * cent_dist
+            
+    try:
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        total_cost = cost_matrix[row_ind, col_ind].sum()
+        m = len(row_ind)
+        return float(total_cost / m) if m > 0 else float("inf")
+    except Exception:
+        return float("inf")
 
 
 # =====================================================================
@@ -1800,10 +1871,10 @@ def train_agnostic(categories=None):
     if categories is None:
         categories = get_categories()
 
-    print("\n" + "=" * 60)
-    print("  CATEGORY-AGNOSTIC VNN TRAINING")
-    print(f"  Categories: {', '.join(categories)}")
-    print("=" * 60)
+    # print("\n" + "=" * 60)
+    # print("  CATEGORY-AGNOSTIC VNN TRAINING")
+    # print(f"  Categories: {', '.join(categories)}")
+    # print("=" * 60)
 
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
@@ -2426,7 +2497,7 @@ def run_agnostic(categories=None):
 
     print("\n" + "#" * 60)
     print("  FULL PIPELINE: AGNOSTIC TRAIN + GENERATE + EVALUATE")
-    print(f"  Categories: {', '.join(categories)}")
+    # print(f"  Categories: {', '.join(categories)}")
     if USE_ONLY_N_SAMPLES: print(f"  Samples per category: {N_SAMPLES}")
     print(f"  Rotation augmentation: {N_ROTATIONS}x")
     print("#" * 60)
