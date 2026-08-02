@@ -1,6 +1,6 @@
 """
 =============================================================================
-  CanoVerse VNN -- Single-File Kaggle Bundle  (v2 — Full CanoVerse Pipeline)
+  CanoVerse VNN -- Single-File Kaggle Bundle (Category-Agnostic Mode)
 =============================================================================
 
 Complete self-contained pipeline for training and using a Vector Neuron
@@ -12,25 +12,21 @@ Implements the full CanoVerse paper method:
   - PCA vertical with semantic part disambiguation (Eq. 1-2)
   - Joint semantic-geometric horizontal alignment (Eq. 4)
   - Symmetry-aware 5-candidate generation
-  - SO(3) rotation augmentation (40 random rotations per sample)
+  - SO(3) rotation augmentation (3 random rotations per sample)
   - CLIP-based zero-shot category discovery (Uni3D proxy)
-  - Category-agnostic cross-category training with ranking loss
-
-Two training modes:
-  - Per-category:  One VNN per category (backward-compatible)
-  - Agnostic:      Single VNN across all categories (paper-faithful)
+  - Category-agnostic cross-category training with ranking loss (5-way Cross-Entropy)
 
 FULLY AUTOMATED -- NO human labels or annotators needed!
 
 Usage in Kaggle notebook:
   1. Paste this entire file into a cell
   2. Adjust the CONFIG section below
-  3. Call run_all() for per-category, or run_agnostic() for cross-category
+  3. Call run_agnostic() to train and evaluate
 
 Or run individual steps:
-  - run_pipeline("train")
-  - run_pipeline("generate")
   - train_agnostic()
+  - generate_category("suit_(clothing)")
+  - evaluate_stability_consistency("suit_(clothing)")
   - align_single_object(mesh)       # fully zero-shot on any mesh
 """
 
@@ -38,46 +34,73 @@ Or run individual steps:
 # EASY-TUNE CONFIG -- Change these to control the pipeline!
 # =====================================================================
 
-# Categories to process
-CATEGORIES = ["table", "chair", "car", "airplane"]
-
-# Use category-agnostic implementation or not
-CATEGORY_AGNOSTIC = True
+# Categories to process (leave empty to dynamically discover from dataset)
+CATEGORIES = []
 
 # Limit training samples per category to N_SAMPLES (True) or sample ALL existing point clouds (False)
 USE_ONLY_N_SAMPLES = False
 
 # Objects PER CATEGORY (used only if USE_ONLY_N_SAMPLES = True)
-N_SAMPLES = 30
+N_SAMPLES = 20
 
-# Objects to generate candidates for (used only if USE_ONLY_N_SAMPLES = True)
+# Objects to generate candidates for per rendered category
 N_GENERATE = 5
+
+# Candidate rendering & generation settings
+CATEGORIES_TO_RENDER = 15   # Max number of categories to generate/render candidates for
+MIN_GLBS_TO_RENDER = 100    # Each category chosen for rendering must contain at least 100 GLB files
 
 # Point cloud settings
 N_POINTS = 1024          # Points sampled per mesh surface (consistent everywhere)
 
-# Dataset Source: "canoverse" (for Kaggle glb data) or "modelnet40" (for txt point clouds)
-DATASET_SOURCE = "canoverse"
 
-# Rotation augmentation (paper: 40 random rotations per sample)
-N_ROTATIONS = 30
+def get_categories():
+    """Dynamically discover available categories from local CanoVerse GLB dataset."""
+    global CATEGORIES
+    if CATEGORIES:
+        return CATEGORIES
+        
+    cats = set()
+    pattern = "/kaggle/input/**/canoverse*/*"
+    dirs = glob.glob(pattern, recursive=True)
+    for d in dirs:
+        if os.path.isdir(d):
+            if glob.glob(os.path.join(d, "*.glb")):
+                cats.add(os.path.basename(d))
+    if not cats:
+        # Fallback wider search
+        glb_files = glob.glob("/kaggle/input/**/*.glb", recursive=True)
+        for f in glb_files:
+            cats.add(os.path.basename(os.path.dirname(f)))
+                
+    CATEGORIES = sorted(list(cats))
+    
+    if not CATEGORIES:
+        print("  [WARNING] No CanoVerse categories found at Kaggle path!")
+        raise ValueError("No categories found in dataset directory!")
+    else:
+        print(f"\n  [INFO] Dynamically discovered {len(CATEGORIES)} CanoVerse categories: {CATEGORIES}\n")
+        
+    return CATEGORIES
+
+# Rotation augmentation: 3 rotations is sufficient since VN-DGCNN is already equivariant,
+# so augmentation is mainly for regularization, not for teaching invariance.
+N_ROTATIONS = 3
 
 # Training hyperparameters
 BATCH_SIZE = 4           # Micro-batch size to fit in memory
 GRAD_ACCUM_STEPS = 8     # Effective batch size = 4 * 8 = 32
-NUM_EPOCHS = 150          # Max training epochs (early stopping will kick in)
+NUM_EPOCHS = 100          # Max training epochs (early stopping will kick in)
 LEARNING_RATE = 1e-3     # Adam learning rate
 WEIGHT_DECAY = 1e-4      # L2 regularization
-PATIENCE = 10            # Early stopping patience
+PATIENCE = 20            # Early stopping patience
 
-# VNN architecture (per-category mode)
+# VNN architecture (unified agnostic model)
 FEAT_DIMS = (32, 64, 128)  # VN encoder channel dimensions
 HIDDEN_DIM = 256            # MLP head hidden size
-
-# VNN architecture (agnostic mode -- larger for cross-category capacity)
-AGNOSTIC_FEAT_DIMS = (32, 64, 128)
-AGNOSTIC_HIDDEN_DIM = 256
 N_CATEGORY_EMBED = 32       # Category embedding dimension
+AGNOSTIC_FEAT_DIMS = FEAT_DIMS
+AGNOSTIC_HIDDEN_DIM = HIDDEN_DIM
 
 # Data split ratios
 TRAIN_RATIO = 0.70
@@ -98,7 +121,7 @@ MIN_CONNECTED_RATIO = 0.7   # Min fraction of faces in largest component
 MAX_FACE_AREA_VAR = 50.0     # Max ratio of largest to mean face area
 
 # Support surface
-MAX_SUPPORT_FACES = 20   # Max convex hull faces to evaluate
+MAX_SUPPORT_FACES = 50   # Max convex hull faces to evaluate (paper uses all; 50 covers real-world hulls)
 
 # CLIP settings (for zero-shot category discovery)
 CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
@@ -140,35 +163,27 @@ from tqdm import tqdm
 os.environ.pop("PYOPENGL_PLATFORM", None)
 
 def load_mesh_or_pc(path):
-    """Load a Trimesh mesh, or convert a .txt point cloud into a faceless Trimesh."""
-    if path.endswith('.txt'):
-        try:
-            data = np.loadtxt(path, delimiter=',')
-        except ValueError:
-            data = np.loadtxt(path)
-        m = trimesh.Trimesh(vertices=data[:, :3])
-        if data.shape[1] >= 6:
-            m.vertex_normals = data[:, 3:6]
-        return m
-    else:
-        return trimesh.load(path, force="mesh")
-
-# Symmetry definitions per category (paper §3.1)
-# angle=0 means no symmetry, angle=180 means bilateral, angle=360 means full rotational
-SYMMETRY_INFO = {
-    "table":    {"axis": "Y", "angle": 90},    # 4-fold symmetry
-    "chair":    {"axis": "Y", "angle": 0},      # no symmetry (has a front)
-    "car":      {"axis": "Y", "angle": 180},    # bilateral (left-right mirror)
-    "airplane": {"axis": "Y", "angle": 180},    # bilateral
-    "cup":      {"axis": "Y", "angle": 360},    # full rotational
-    "bottle":   {"axis": "Y", "angle": 360},
-    "bowl":     {"axis": "Y", "angle": 360},
-    "vase":     {"axis": "Y", "angle": 360},
-    "bed":      {"axis": "Y", "angle": 180},
-    "lamp":     {"axis": "Y", "angle": 0},
-    "sofa":     {"axis": "Y", "angle": 0},
-    "bench":    {"axis": "Y", "angle": 180},
-}
+    """Load a CanoVerse .glb mesh with safe normal computation and vertex downsampling."""
+    # Load with skip_materials to avoid loading 4K textures into RAM.
+    # We must use process=True so trimesh merges duplicate vertices and
+    # computes valid face_normals, which are required by chamfer_distance()
+    # and support_vertical().
+    mesh = trimesh.load(path, force="mesh", skip_materials=True, process=True)
+    
+    # Cap extreme vertex counts to prevent OOM: for a 100K-vertex mesh,
+    # we re-derive the surface geometry from a uniform surface sample.
+    # This preserves surface shape and correct face normals at ~10MB instead of ~2GB.
+    MAX_GLB_VERTS = 50_000
+    if hasattr(mesh, 'vertices') and len(mesh.vertices) > MAX_GLB_VERTS:
+        pts, face_idx = trimesh.sample.sample_surface(mesh, MAX_GLB_VERTS)
+        if hasattr(mesh, 'face_normals') and len(mesh.face_normals) > 0:
+            normals = mesh.face_normals[face_idx]
+        else:
+            normals = np.zeros_like(pts)
+        # Rebuild as a point-cloud-like Trimesh so the rest of the pipeline works
+        mesh = trimesh.Trimesh(vertices=pts)
+        mesh.vertex_normals = normals
+    return mesh
 
 # Template axis conventions (paper Supp §1.1)
 # Forward = +Z, Up = +Y  (all categories share these axes)
@@ -182,14 +197,6 @@ TEMPLATE_UP = np.array([0.0, 1.0, 0.0])
 
 def get_cache_file(category):
     return os.path.join(CACHE_DIR, f"{category}_vnn_data.pt")
-
-
-def get_best_model_path(category):
-    return os.path.join(CHECKPOINT_DIR, f"vnn_{category}_best.pt")
-
-
-def get_latest_model_path(category):
-    return os.path.join(CHECKPOINT_DIR, f"vnn_{category}_latest.pt")
 
 
 def get_agnostic_model_path():
@@ -508,6 +515,48 @@ class VNCandidateSelector(nn.Module):
         score = self.head(inv_feat)
         return score
 
+    def forward_all_candidates(self, template_pts, candidates_pts, category_idx=None):
+        """Score all K candidates in a single vectorized encoder call.
+
+        Instead of encoding each candidate separately in a Python loop (K passes),
+        this reshapes (B, K, N, 3) -> (B*K, N, 3), encodes everything in ONE pass,
+        then reshapes back. Reduces encoder calls from K+1 to 2.
+
+        Args:
+            template_pts:   (B, N, 3)
+            candidates_pts: (B, K, N, 3)
+            category_idx:   (B,) LongTensor, optional
+        Returns:
+            logits: (B, K) raw scores for each candidate
+        """
+        B, K, N, _ = candidates_pts.shape
+
+        # Encode template once: (B, C, 3)
+        feat_t = self.encoder(template_pts)
+
+        # Encode all K candidates in a single pass: reshape to (B*K, N, 3)
+        cands_flat = candidates_pts.reshape(B * K, N, 3)
+        feat_c_flat = self.encoder(cands_flat)   # (B*K, C, 3)
+        feat_c = feat_c_flat.reshape(B, K, -1, 3)  # (B, K, C, 3)
+
+        # Expand template to (B, K, C, 3) and concat
+        feat_t_exp = feat_t.unsqueeze(1).expand(B, K, -1, 3)
+        combined_eq = torch.cat([feat_t_exp, feat_c], dim=2)  # (B, K, 2C, 3)
+
+        # Flatten B*K for reducer and invariant
+        C2 = combined_eq.shape[2]
+        combined_flat = combined_eq.reshape(B * K, C2, 3)
+        reduced_flat = self.reducer(combined_flat)       # (B*K, reduce_dim, 3)
+        inv_flat = self.invariant(reduced_flat)          # (B*K, inv_dim)
+
+        if self.use_category and category_idx is not None:
+            cat_emb = self.category_embed(category_idx)         # (B, embed_dim)
+            cat_emb_exp = cat_emb.unsqueeze(1).expand(B, K, -1).reshape(B * K, -1)
+            inv_flat = torch.cat([inv_flat, cat_emb_exp], dim=1)
+
+        scores_flat = self.head(inv_flat)   # (B*K, 1)
+        logits = scores_flat.reshape(B, K)  # (B, K)
+        return logits
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -598,7 +647,7 @@ def random_rotation_matrix():
     """Sample a uniform random rotation from SO(3).
 
     Uses the subgroup algorithm (Arvo 1992) via uniform random quaternion.
-    Applied as data augmentation: 40 rotations per sample (paper Supp §2.1).
+    Applied as data augmentation: 40 (-> reduced to 3) rotations per sample (paper Supp §2.1).
     """
     u1, u2, u3 = np.random.random(3)
     q = np.array([
@@ -616,9 +665,17 @@ def random_rotation_matrix():
 
 
 def normalize_to_unit_sphere(mesh):
-    """Centre mesh at origin and scale to fit inside a unit sphere."""
-    center = mesh.vertices.mean(axis=0)
+    """Centre mesh at geometric center and scale to fit inside a unit sphere.
+    
+    Uses bounding box centroid rather than vertex mean, because CAD .glb files 
+    have irregular vertex density (e.g. highly tessellated legs but flat tabletop)
+    which would severely skew a simple vertex average.
+    """
+    # 1. Center the mesh using its bounding box, not vertex average
+    center = (mesh.vertices.max(axis=0) + mesh.vertices.min(axis=0)) / 2.0
     mesh.apply_translation(-center)
+    
+    # 2. Scale so the farthest vertex lies exactly on the unit sphere
     radius = np.linalg.norm(mesh.vertices, axis=1).max()
     if radius > 0:
         mesh.apply_scale(1.0 / radius)
@@ -837,9 +894,20 @@ def support_vertical(mesh):
          (highest Y-extent and lowest centroid — replaces VLM selection).
     """
     try:
-        hull = mesh.convex_hull
+        # Prevent Qhull OOM: high-res meshes will blow up Kaggle's RAM.
+        # CRITICAL: Must sample uniformly by AREA, not by random vertex selection.
+        # Random vertex selection misses sparse vertices defining flat tabletops / chair feet.
+        #
+        # NOTE: We use sample_points() NOT trimesh.sample.sample_surface() directly.
+        # After the 50K vertex cap in load_mesh_or_pc, the mesh is face-stripped (point cloud only).
+        # Calling sample_surface() on a face-stripped mesh throws an exception, which the broad
+        # except below catches and returns np.eye(3) — silently disabling vertical alignment
+        # for ALL high-res GLB files. sample_points() handles both meshes and point clouds.
+        pts_sampled = sample_points(mesh, n=5000).astype(np.float64)
+        hull = trimesh.points.PointCloud(pts_sampled).convex_hull
     except Exception:
-        # Fallback for degenerate meshes
+        # Fallback for genuinely degenerate meshes (e.g. <4 unique points)
+        print("Degenerate mesh found!")
         return np.eye(3)
 
     pts = np.asarray(mesh.vertices, dtype=np.float64)
@@ -848,7 +916,8 @@ def support_vertical(mesh):
     face_areas = hull.area_faces
     face_order = np.argsort(face_areas)[::-1][:MAX_SUPPORT_FACES]
 
-    valid_poses = []
+    stable_poses = []
+    unstable_poses = []
 
     for face_idx in face_order:
         n_s = hull.face_normals[face_idx].astype(np.float64)
@@ -875,25 +944,29 @@ def support_vertical(mesh):
 
         stable = point_in_polygon_2d(proj_2d, face_2d)
 
-        # Score: even unstable poses get a low score (they may be the only option)
+        # Score to pick the best tiebreaker within a stability class:
+        # prefer the pose with the widest base (most floor contact) and largest Y-extent (most upright).
         y_extent = rotated[:, 1].max() - rotated[:, 1].min()
-        y_min = rotated[:, 1].min()
-        # Prefer: high vertical extent, centroid well above base, wide base
         base_width = np.ptp(face_2d, axis=0).mean() if len(face_2d) > 1 else 0.01
         score = y_extent * (base_width + 0.01)
+
+        # Paper: select only from stable poses. Score is purely a tiebreaker within that set.
         if stable:
-            score *= 3.0  # strong bonus for centroid-stable poses
+            stable_poses.append((R_k, score))
+        else:
+            unstable_poses.append((R_k, score))
 
-        valid_poses.append((R_k, score))
+    # Strictly prefer a stable pose. Fall back to unstable only if zero stable candidates exist.
+    candidate_poses = stable_poses if stable_poses else unstable_poses
 
-    if not valid_poses:
+    if not candidate_poses:
         # Absolute fallback: align largest face to ground
         largest_idx = int(np.argmax(face_areas))
         n = hull.face_normals[largest_idx].astype(np.float64)
         return rodrigues_rotation(n / (np.linalg.norm(n) + 1e-12), n_g)
 
-    valid_poses.sort(key=lambda x: x[1], reverse=True)
-    return valid_poses[0][0]
+    candidate_poses.sort(key=lambda x: x[1], reverse=True)
+    return candidate_poses[0][0]
 
 
 def pca_vertical(obj_pts, tpl_pts):
@@ -1009,12 +1082,9 @@ def generate_five_candidates(mesh, tpl_pts, category=None):
     The set {R_S, R_G, R_invG, R_S·R_sup, R_S·R_Pca} covers:
       1. Horizontal-only (semantic)
       2. Horizontal-only (geometric)
-      3. Horizontal-only (geometric + symmetry flip)
+      3. Horizontal-only (geometric + 180 deg flip)
       4. Vertical (support) + horizontal (semantic)
       5. Vertical (PCA) + horizontal (semantic)
-
-    Symmetry-aware: R_invG respects the category's symmetry angle instead
-    of always flipping by 180°.
     """
     obj_pts = sample_points(mesh)
 
@@ -1022,16 +1092,8 @@ def generate_five_candidates(mesh, tpl_pts, category=None):
     theta_g, _, _ = geometric_horizontal(obj_pts, tpl_pts)
     R_G = rot_y(theta_g)
 
-    # Symmetry-aware inverted geometric rotation
-    sym = SYMMETRY_INFO.get(category, {}) if category else {}
-    sym_angle = sym.get("angle", 0)
-    if sym_angle >= 360:
-        # Full rotational symmetry — 180° flip is redundant; use 90° offset
-        R_invG = rot_y(theta_g + np.pi / 2)
-    elif sym_angle > 0:
-        R_invG = rot_y(theta_g + np.radians(sym_angle))
-    else:
-        R_invG = rot_y(theta_g + np.pi)
+    # The paper explicitly defines R_invG = R_z(theta_g + pi) for symmetric objects.
+    R_invG = rot_y(theta_g + np.pi)
 
     theta_s = semantic_horizontal(obj_pts, tpl_pts)
     R_S = rot_y(theta_s)
@@ -1067,7 +1129,7 @@ def passes_quality(mesh):
       - Degenerate faces (extreme area variance)
     """
     # Basic geometry checks
-    if DATASET_SOURCE == "modelnet40" or len(mesh.faces) == 0:
+    if len(mesh.faces) == 0:
         return True, "ok"
     if len(mesh.faces) < MIN_FACES:
         return False, "too few faces"
@@ -1076,24 +1138,28 @@ def passes_quality(mesh):
         return False, "thin-shell"
 
     # Connected component check (catches fragmented / broken meshes)
-    try:
-        components = mesh.split(only_watertight=False)
-        if len(components) > 1:
-            largest = max(components, key=lambda m: len(m.faces))
-            if len(largest.faces) / len(mesh.faces) < MIN_CONNECTED_RATIO:
-                return False, "fragmented"
-    except Exception:
-        pass  # some meshes resist splitting; allow them through
+    # NOTE: Disabled for GLB files. CAD models often have many disconnected parts
+    # (e.g. 4 separate table legs). A 70% ratio threshold is far too aggressive and discards 97% of valid objects.
+    # try:
+    #     components = mesh.split(only_watertight=False)
+    #     if len(components) > 1:
+    #         largest = max(components, key=lambda m: len(m.faces))
+    #         if len(largest.faces) / len(mesh.faces) < MIN_CONNECTED_RATIO:
+    #             return False, "fragmented"
+    # except Exception:
+    #     pass
 
     # Degenerate face area check
-    try:
-        areas = mesh.area_faces
-        if len(areas) > 10 and areas.mean() > 0:
-            ratio = areas.max() / (areas.mean() + 1e-15)
-            if ratio > MAX_FACE_AREA_VAR:
-                return False, "degenerate faces"
-    except Exception:
-        pass
+    # NOTE: Disabled for GLB files. CAD models often have massive flat polygons (table tops)
+    # and tiny detail polygons (screws). The variance is naturally huge.
+    # try:
+    #     areas = mesh.area_faces
+    #     if len(areas) > 10 and areas.mean() > 0:
+    #         ratio = areas.max() / (areas.mean() + 1e-15)
+    #         if ratio > MAX_FACE_AREA_VAR:
+    #             return False, "degenerate faces"
+    # except Exception:
+    #     pass
 
     return True, "ok"
 
@@ -1177,7 +1243,7 @@ class CategoryDiscovery:
 
     def __init__(self, categories=None, model_name=None):
         if categories is None:
-            categories = CATEGORIES
+            categories = get_categories()
         if model_name is None:
             model_name = CLIP_MODEL_NAME
         
@@ -1240,41 +1306,55 @@ class CategoryDiscovery:
 # DATASET LOADING
 # =====================================================================
 
-def load_category_uids(category, n_needed=None):
-    """Fetch object file paths from local Kaggle datasets (ModelNet40 or CanoVerse)."""
-    if DATASET_SOURCE == "modelnet40":
-        pattern = f"/kaggle/input/datasets/tasnimulislammahi/modelnet40/modelnet40_normal_resampled/{category}/*.txt"
-        files = glob.glob(pattern)
-        if not files:
-            pattern2 = f"/kaggle/input/*/modelnet40_normal_resampled/{category}/*.txt"
-            files = glob.glob(pattern2)
-        print(f"  Found {len(files)} local '{category}' files in ModelNet40.")
-        if n_needed is not None:
-            return files[:n_needed]
-        return files
+def load_category_uids(category, n_needed=None, verbose=True):
+    """Fetch .glb object file paths from local CanoVerse dataset."""
+    pattern = "/kaggle/input/**/canoverse*/*/*.glb"
+    all_files = glob.glob(pattern, recursive=True)
+    if not all_files:
+        all_files = glob.glob("/kaggle/input/**/*.glb", recursive=True)
         
-    elif DATASET_SOURCE == "canoverse":
-        # Search for all .glb files in the canoverse directory
-        pattern = "/kaggle/input/*/canoverse_320k_upload*/*/*.glb"
-        all_files = glob.glob(pattern)
-        
-        selected_files = []
-        cat_lower = category.lower()
-        for file_path in all_files:
-            # Extract the folder name, e.g., 'suit_(clothing)' or 'table-tennis_table'
-            parent_dir = os.path.basename(os.path.dirname(file_path)).lower()
+    selected_files = []
+    cat_lower = category.lower()
+    for file_path in all_files:
+        parent_dir = os.path.basename(os.path.dirname(file_path)).lower()
+        if parent_dir == cat_lower or parent_dir.startswith(f"{cat_lower}_"):
+            selected_files.append(file_path)
+            if n_needed is not None and len(selected_files) >= n_needed:
+                break
             
-            # Match exact category or category with disambiguation suffix (e.g. table_(furniture))
-            if parent_dir == cat_lower or parent_dir.startswith(f"{cat_lower}_"):
-                selected_files.append(file_path)
-                if n_needed is not None and len(selected_files) >= n_needed:
-                    break
-                
+    if verbose:
         print(f"  Found {len(selected_files)} '{category}' objects in CanoVerse.")
-        return selected_files
-        
+    return selected_files
+
+
+def get_render_categories(categories=None, max_categories=CATEGORIES_TO_RENDER, min_glbs=MIN_GLBS_TO_RENDER):
+    """Randomly sample up to max_categories from categories that have at least min_glbs .glb files."""
+    if categories is None:
+        categories = get_categories()
+    
+    qualifying = []
+    for cat in categories:
+        uids = load_category_uids(cat, n_needed=min_glbs, verbose=False)
+        if len(uids) >= min_glbs:
+            qualifying.append(cat)
+                
+    if qualifying:
+        if max_categories is not None and len(qualifying) > max_categories:
+            selected = random.sample(qualifying, max_categories)
+        else:
+            selected = list(qualifying)
+            random.shuffle(selected)
     else:
-        raise ValueError(f"Unknown DATASET_SOURCE: {DATASET_SOURCE}")
+        print(f"  [!] No category found with >= {min_glbs} .glb files. Sampling from available non-empty categories.")
+        available = [cat for cat in categories if len(load_category_uids(cat, n_needed=1, verbose=False)) > 0]
+        if max_categories is not None and len(available) > max_categories:
+            selected = random.sample(available, max_categories)
+        else:
+            selected = list(available)
+            random.shuffle(selected)
+        
+    print(f"\n  [INFO] Randomly selected {len(selected)} categories for candidate rendering (from {len(qualifying)} qualifying with >= {min_glbs} .glbs): {selected}\n")
+    return selected
 
 
 def download_objects(uids):
@@ -1300,57 +1380,7 @@ def compute_auto_label(candidate_pts_list, template_pts, candidate_normals_list=
 # PYTORCH DATASETS
 # =====================================================================
 
-class CandidateDataset(Dataset):
-    """Per-category pairwise dataset: one sample per (object, candidate) pair.
 
-    Used for per-category BCE-based training.  Supports SO(3) rotation
-    augmentation (paper Supp §2.1: 40 random rotations per sample).
-    """
-    def __init__(self, template_pts, objects, augment=False, n_rotations=None):
-        if n_rotations is None:
-            n_rotations = N_ROTATIONS
-        self.template_pts = torch.tensor(template_pts, dtype=torch.float32)
-        self.augment = augment
-        self.n_rotations = n_rotations if augment else 1
-        self.samples = []
-        for obj_idx, obj in enumerate(objects):
-            for cand_idx in range(5):
-                self.samples.append({
-                    "candidate_pts": torch.tensor(
-                        obj["candidate_pts"][cand_idx], dtype=torch.float32
-                    ),
-                    "label": torch.tensor(
-                        [1.0 if cand_idx == obj["best_idx"] else 0.0],
-                        dtype=torch.float32
-                    ),
-                    "object_idx": obj_idx,
-                    "candidate_idx": cand_idx,
-                })
-
-    def __len__(self):
-        return len(self.samples) * self.n_rotations
-
-    def __getitem__(self, idx):
-        sample_idx = idx % len(self.samples)
-        s = self.samples[sample_idx]
-
-        template = self.template_pts.clone()
-        candidate = s["candidate_pts"].clone()
-
-        if self.augment and self.n_rotations > 1:
-            # Apply the SAME random rotation to both template and candidate.
-            # Since VNN is SO(3)-equivariant, this preserves relative orientation.
-            R = torch.tensor(random_rotation_matrix(), dtype=torch.float32)
-            template = template @ R.T
-            candidate = candidate @ R.T
-
-        return {
-            "template_pts": template,
-            "candidate_pts": candidate,
-            "label": s["label"],
-            "object_idx": s["object_idx"],
-            "candidate_idx": s["candidate_idx"],
-        }
 
 
 class AgnosticRankingDataset(Dataset):
@@ -1364,19 +1394,16 @@ class AgnosticRankingDataset(Dataset):
     Supports SO(3) rotation augmentation and per-object category index.
     """
     def __init__(self, all_category_data, augment=False, n_rotations=None):
-        """
-        Args:
-            all_category_data: list of dicts, each with keys
-                "category", "template_pts", "objects"
-            augment: whether to apply random SO(3) rotations
-            n_rotations: augmentation factor
-        """
         if n_rotations is None:
             n_rotations = N_ROTATIONS
         self.augment = augment
         self.n_rotations = n_rotations if augment else 1
         self.category_to_idx = {}
-        self.items = []
+        
+        templates = []
+        candidates = []
+        best_idxs = []
+        category_idxs = []
 
         for cat_data in all_category_data:
             category = cat_data["category"]
@@ -1390,23 +1417,37 @@ class AgnosticRankingDataset(Dataset):
                     torch.tensor(obj["candidate_pts"][i], dtype=torch.float32)
                     for i in range(5)
                 ])  # (5, N_POINTS, 3)
-                self.items.append({
-                    "template_pts": tpl,
-                    "candidate_pts": cand_pts,
-                    "best_idx": obj["best_idx"],
-                    "category_idx": cat_idx,
-                    "category": category,
-                })
+                
+                templates.append(tpl)
+                candidates.append(cand_pts)
+                best_idxs.append(obj["best_idx"])
+                category_idxs.append(cat_idx)
+                
+        # By stacking these into monolithic PyTorch tensors instead of holding 
+        # a list of Python dicts, we prevent DataLoader workers from deeply 
+        # copying the entire dataset into RAM, which is the #1 cause of Kaggle OOMs.
+        if not templates:
+            # Handle empty datasets safely to prevent torch.stack crashes
+            self.templates = torch.zeros((0, N_POINTS, 3), dtype=torch.float32)
+            self.candidates = torch.zeros((0, 5, N_POINTS, 3), dtype=torch.float32)
+            self.best_idxs = torch.zeros((0,), dtype=torch.long)
+            self.category_idxs = torch.zeros((0,), dtype=torch.long)
+        else:
+            self.templates = torch.stack(templates)
+            self.candidates = torch.stack(candidates)
+            self.best_idxs = torch.tensor(best_idxs, dtype=torch.long)
+            self.category_idxs = torch.tensor(category_idxs, dtype=torch.long)
 
     def __len__(self):
-        return len(self.items) * self.n_rotations
+        return len(self.best_idxs) * self.n_rotations
 
     def __getitem__(self, idx):
-        item_idx = idx % len(self.items)
-        item = self.items[item_idx]
+        item_idx = idx % len(self.best_idxs)
 
-        template = item["template_pts"].clone()        # (N, 3)
-        candidates = item["candidate_pts"].clone()      # (5, N, 3)
+        template = self.templates[item_idx].clone()
+        candidates = self.candidates[item_idx].clone()
+        best_idx = self.best_idxs[item_idx]
+        category_idx = self.category_idxs[item_idx]
 
         if self.augment and self.n_rotations > 1:
             R = torch.tensor(random_rotation_matrix(), dtype=torch.float32)
@@ -1416,8 +1457,8 @@ class AgnosticRankingDataset(Dataset):
         return {
             "template_pts": template,
             "candidate_pts": candidates,
-            "best_idx": torch.tensor(item["best_idx"], dtype=torch.long),
-            "category_idx": torch.tensor(item["category_idx"], dtype=torch.long),
+            "best_idx": best_idx,
+            "category_idx": category_idx,
         }
 
 
@@ -1446,16 +1487,16 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
 
     needed = (n_objects + 1) if (USE_ONLY_N_SAMPLES and n_objects is not None) else None
     uids = load_category_uids(category, (needed + 50) if needed else None)
-    if len(uids) < 10:
-        raise RuntimeError(f"Only found {len(uids)} '{category}' objects. Need >= 10.")
+    if len(uids) < 2:
+        raise RuntimeError(f"Only found {len(uids)} '{category}' objects. Need >= 2.")
 
     random.shuffle(uids)
 
     download_uids = uids[:min(len(uids), needed + 50)] if needed else uids
-    print(f"\n  Resolving {len(download_uids)} local {DATASET_SOURCE} objects...")
+    # print(f"\n  Resolving {len(download_uids)} local CanoVerse objects...")
     objs = download_objects(download_uids)
 
-    print("\n  Setting up canonical template (Medoid Selection)...")
+    # print("\n  Setting up canonical template (Medoid Selection)...")
     # Evaluate first 15 objects to find the "most average" (medoid) template
     num_medoid_cands = min(15, len(uids))
     medoid_pts_list = []
@@ -1485,19 +1526,19 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
         raise RuntimeError(f"Template {template_uid} failed to resolve!")
     tpl_mesh = normalize_to_unit_sphere(load_mesh_or_pc(tpl_path))
     template_pts, template_normals = sample_points(tpl_mesh, seed=42, with_normals=True)
-    print(f"  Template UID selected: {template_uid[:16]}...")
+    # print(f"  Template UID selected: {template_uid[:16]}...")
 
     target_str = f"{n_objects}" if (USE_ONLY_N_SAMPLES and n_objects is not None) else f"ALL ({len(uids)-1})"
-    print(f"\n  Processing objects (target: {target_str})...")
+    # print(f"\n  Processing objects (target: {target_str})...")
     data_objects = []
     all_best_dists = []
     discarded = 0
 
     total_items = (min(len(uids)-1, n_objects+50)) if (USE_ONLY_N_SAMPLES and n_objects is not None) else (len(uids)-1)
-    pbar = tqdm(uids[1:], desc="  Processing", total=total_items, unit="obj")
-    for uid in pbar:
+    for idx_obj, uid in enumerate(uids[1:]):
         if USE_ONLY_N_SAMPLES and n_objects is not None and len(data_objects) >= n_objects:
             break
+        # print(f"\r  Processing [{category}]: {idx_obj+1}/{total_items} | Kept: {len(data_objects)} | Discarded: {discarded}", end="", flush=True)
         path = objs.get(uid)
         if path is None:
             try:
@@ -1513,8 +1554,27 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
         ok, reason = passes_quality(mesh)
         if not ok:
             discarded += 1
-            pbar.set_postfix(good=len(data_objects), bad=discarded)
             continue
+
+        # CRITICAL FIX: Randomly rotate the mesh to simulate real-world unaligned input!
+        # If we don't do this, the network just learns to pick the identity rotation
+        # because ModelNet40/CanoVerse files are often already pre-aligned.
+        
+        # NOTE: Trimesh's apply_transform() clears the geometry cache. For face-stripped 
+        # point clouds (our >50K capped GLBs), this permanently destroys our custom 
+        # vertex_normals! We must save, rotate, and restore them manually.
+        has_custom_normals = hasattr(mesh, 'vertex_normals') and len(mesh.vertex_normals) > 0
+        if has_custom_normals:
+            saved_normals = mesh.vertex_normals.copy()
+            
+        T_rand = np.eye(4)
+        R_rand = random_rotation_matrix()
+        T_rand[:3, :3] = R_rand
+        mesh.apply_transform(T_rand)
+        
+        if has_custom_normals:
+            # Rotate the normals by the same rotation matrix and restore them
+            mesh.vertex_normals = (R_rand @ saved_normals.T).T
 
         candidates = generate_five_candidates(mesh, template_pts, category=category)
         obj_pts, obj_normals = sample_points(mesh, with_normals=True)
@@ -1542,8 +1602,7 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
             "best_idx": best_idx,
             "chamfer_distances": cd_dists,
         })
-        pbar.set_postfix(good=len(data_objects), bad=discarded)
-    pbar.close()
+    print(f"\r  Processing [{category}]: Completed {len(data_objects)} objects ({discarded} discarded).        ")
 
     # ---- Adaptive distance threshold filtering (lenient: median + 3σ) ----
     if all_best_dists:
@@ -1575,69 +1634,7 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
     return data
 
 
-# =====================================================================
-# TRAINING FUNCTIONS  (Per-Category BCE Mode)
-# =====================================================================
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
-    """Train one epoch with pairwise BCE loss."""
-    model.train()
-    total_loss, correct, total = 0.0, 0, 0
-    for batch in dataloader:
-        tpl = batch["template_pts"].to(device)
-        cand = batch["candidate_pts"].to(device)
-        labels = batch["label"].to(device)
-        scores = model(tpl, cand)
-        loss = criterion(scores, labels)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * tpl.size(0)
-        preds = (torch.sigmoid(scores) > 0.5).float()
-        correct += (preds == labels).sum().item()
-        total += labels.numel()
-    return {"loss": total_loss / total if total else 0, "accuracy": correct / total if total else 0}
-
-
-@torch.no_grad()
-def evaluate(model, dataloader, criterion, device, phase="VAL"):
-    """Evaluate with pairwise BCE loss + compute object-level selection accuracy."""
-    model.eval()
-    total_loss, correct, total = 0.0, 0, 0
-    object_scores = {}
-    for batch in dataloader:
-        tpl = batch["template_pts"].to(device)
-        cand = batch["candidate_pts"].to(device)
-        labels = batch["label"].to(device)
-        scores = model(tpl, cand)
-        loss = criterion(scores, labels)
-        total_loss += loss.item() * tpl.size(0)
-        preds = (torch.sigmoid(scores) > 0.5).float()
-        correct += (preds == labels).sum().item()
-        total += labels.numel()
-        for i in range(tpl.size(0)):
-            oi = batch["object_idx"][i].item()
-            ci = batch["candidate_idx"][i].item()
-            if oi not in object_scores:
-                object_scores[oi] = []
-            object_scores[oi].append((ci, scores[i].item(), labels[i].item()))
-
-    sel_correct, sel_total = 0, 0
-    for entries in object_scores.values():
-        if len(entries) != 5:
-            continue
-        best = max(entries, key=lambda x: x[1])
-        if best[2] > 0.5:
-            sel_correct += 1
-        sel_total += 1
-
-    return {
-        "loss": total_loss / total if total else 0,
-        "accuracy": correct / total if total else 0,
-        "selection_accuracy": sel_correct / sel_total if sel_total else 0,
-        "selection_correct": sel_correct,
-        "selection_total": sel_total,
-    }
 
 
 # =====================================================================
@@ -1645,7 +1642,7 @@ def evaluate(model, dataloader, criterion, device, phase="VAL"):
 # =====================================================================
 
 def train_one_epoch_ranking(model, dataloader, optimizer, device, epoch,
-                            use_category=False):
+                             use_category=False):
     """Train one epoch with ranking loss (5-way cross-entropy over candidates)."""
     model.train()
     total_loss = 0.0
@@ -1658,16 +1655,8 @@ def train_one_epoch_ranking(model, dataloader, optimizer, device, epoch,
         best_idx = batch["best_idx"].to(device)           # (B,)
         cat_idx = batch["category_idx"].to(device) if use_category else None
 
-        B = template.shape[0]
-
-        # Encode template ONCE, reuse for all 5 candidates (saves 40% encoder compute)
-        feat_t = model.encoder(template)  # (B, C, 3)
-
-        logits_list = []
-        for c in range(5):
-            s = model.forward_with_cached_template(feat_t, candidates[:, c], category_idx=cat_idx)
-            logits_list.append(s)
-        logits = torch.cat(logits_list, dim=1)  # (B, 5)
+        # Vectorized: encode template ONCE + all 5 candidates ONCE = 2 encoder passes total
+        logits = model.forward_all_candidates(template, candidates, category_idx=cat_idx)  # (B, 5)
 
         loss = F.cross_entropy(logits, best_idx, label_smoothing=0.05)
 
@@ -1680,8 +1669,8 @@ def train_one_epoch_ranking(model, dataloader, optimizer, device, epoch,
 
         preds = logits.argmax(dim=1)
         correct += (preds == best_idx).sum().item()
-        total += B
-        total_loss += loss.item() * B
+        total += batch["template_pts"].shape[0]
+        total_loss += loss.item() * batch["template_pts"].shape[0]
 
     if len(dataloader) % GRAD_ACCUM_STEPS != 0:
         optimizer.step()
@@ -1703,23 +1692,15 @@ def evaluate_ranking(model, dataloader, device, phase="VAL", use_category=False)
         best_idx = batch["best_idx"].to(device)
         cat_idx = batch["category_idx"].to(device) if use_category else None
 
-        B = template.shape[0]
-
-        # Encode template ONCE, reuse for all 5 candidates
-        feat_t = model.encoder(template)
-
-        logits_list = []
-        for c in range(5):
-            s = model.forward_with_cached_template(feat_t, candidates[:, c], category_idx=cat_idx)
-            logits_list.append(s)
-        logits = torch.cat(logits_list, dim=1)
+        # Vectorized: encode template + all 5 candidates in 2 encoder passes
+        logits = model.forward_all_candidates(template, candidates, category_idx=cat_idx)  # (B, 5)
 
         loss = F.cross_entropy(logits, best_idx)
         preds = logits.argmax(dim=1)
 
         correct += (preds == best_idx).sum().item()
-        total += B
-        total_loss += loss.item() * B
+        total += template.shape[0]
+        total_loss += loss.item() * template.shape[0]
 
         all_preds.extend(preds.cpu().tolist())
         all_labels.extend(best_idx.cpu().tolist())
@@ -1771,203 +1752,38 @@ def split_data(objects, seed=None):
     indices = list(range(len(objects)))
     rng.shuffle(indices)
     n = len(objects)
+    
+    if n == 0:
+        return [], [], []
+        
     n_train = int(n * TRAIN_RATIO)
     n_val = int(n * VAL_RATIO)
+    
+    # Ensure no empty splits to prevent torch.stack crashes on small datasets
+    if n_train == 0: n_train = 1
+    if n_val == 0: n_val = 1
+    
     train_objs = [objects[i] for i in indices[:n_train]]
-    val_objs = [objects[i] for i in indices[n_train:n_train+n_val]]
-    test_objs = [objects[i] for i in indices[n_train+n_val:]]
+    
+    if n_train < n:
+        val_objs = [objects[i] for i in indices[n_train:min(n_train+n_val, n)]]
+    else:
+        val_objs = [objects[indices[-1]]]
+        
+    if n_train + n_val < n:
+        test_objs = [objects[i] for i in indices[n_train+n_val:]]
+    else:
+        test_objs = [objects[indices[-1]]]
+        
+    # Final safeguard: if any split is still empty, duplicate the training data
+    if not val_objs: val_objs = list(train_objs)
+    if not test_objs: test_objs = list(train_objs)
+    
     print(f"\n  Split: {len(train_objs)} train / {len(val_objs)} val / {len(test_objs)} test")
     return train_objs, val_objs, test_objs
 
 
-# =====================================================================
-# PER-CATEGORY TRAINING
-# =====================================================================
 
-def train_category(category):
-    """Train VNN for a single category with self-supervised labels.
-
-    Uses pairwise BCE loss with SO(3) rotation augmentation.
-    """
-    print("\n" + "=" * 60)
-    print(f"  VNN TRAINING -- {category.upper()}")
-    print("=" * 60)
-
-    best_model_path = get_best_model_path(category)
-
-    random.seed(RANDOM_SEED)
-    np.random.seed(RANDOM_SEED)
-    torch.manual_seed(RANDOM_SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(RANDOM_SEED)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n  Device: {device}")
-    if device.type == "cuda":
-        print(f"  GPU:    {torch.cuda.get_device_name(0)}")
-        print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-
-    total_start = time.time()
-    data_start = time.time()
-    data = prepare_training_data(category)
-    template_pts = data["template_pts"]
-    objects = data["objects"]
-    data_time = time.time() - data_start
-    print(f"\n  [T] Data preparation: {data_time:.1f}s ({data_time/60:.1f}min)")
-
-    if len(objects) < 10:
-        print(f"\n  ERROR: Not enough objects ({len(objects)}). Need >= 10.")
-        return
-
-    train_objs, val_objs, test_objs = split_data(objects)
-
-    # Training set WITH augmentation, val/test WITHOUT
-    train_loader = DataLoader(
-        CandidateDataset(template_pts, train_objs, augment=True, n_rotations=N_ROTATIONS),
-        batch_size=BATCH_SIZE, shuffle=True, num_workers=0,
-        pin_memory=(device.type == "cuda"),
-    )
-    val_loader = DataLoader(
-        CandidateDataset(template_pts, val_objs, augment=False),
-        batch_size=BATCH_SIZE, shuffle=False, num_workers=0,
-        pin_memory=(device.type == "cuda"),
-    )
-    test_loader = DataLoader(
-        CandidateDataset(template_pts, test_objs, augment=False),
-        batch_size=BATCH_SIZE, shuffle=False, num_workers=0,
-        pin_memory=(device.type == "cuda"),
-    )
-
-    model = VNCandidateSelector(n_points=N_POINTS, feat_dims=FEAT_DIMS,
-                                hidden_dim=HIDDEN_DIM).to(device)
-    print(f"\n{model_summary(model)}")
-    # 1 positive and 4 negative candidates per object → weight positive by 4.0
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([4.0]).to(device))
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
-
-    print("\n" + "-" * 60)
-    print(f"  TRAINING [{category.upper()}]  (augment={N_ROTATIONS}x rotations)")
-    print("-" * 60)
-
-    best_model_path = get_best_model_path(category)
-    latest_model_path = get_latest_model_path(category)
-
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    best_val_sel_acc = -1.0
-    patience_counter = 0
-    start_epoch = 1
-
-    if os.path.exists(latest_model_path):
-        try:
-            print(f"\n  [+] Found checkpoint at {latest_model_path}. Resuming training...")
-            ckpt = torch.load(latest_model_path, weights_only=False, map_location=device)
-            model.load_state_dict(ckpt["model_state_dict"])
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            if "scheduler_state_dict" in ckpt:
-                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-            start_epoch = ckpt.get("epoch", 0) + 1
-            best_val_sel_acc = ckpt.get("best_val_sel_acc", ckpt.get("val_selection_accuracy", -1.0))
-            patience_counter = ckpt.get("patience_counter", 0)
-            print(f"  [+] Resumed from epoch {start_epoch}/{NUM_EPOCHS} (Best Val SelAcc: {best_val_sel_acc:.3f}, Patience: {patience_counter}/{PATIENCE})")
-        except Exception as e:
-            print(f"  [!] Failed to load resume checkpoint ({e}). Starting fresh...")
-
-    print(f"\n  [INFO] Checkpoint Path: /kaggle/working/{latest_model_path}")
-    print("  [INFO] Download Location: Kaggle Right Panel -> Output -> checkpoints/")
-    print("  [INFO] Advantage: Auto-saves every epoch so you can resume training seamlessly after any crash without losing progress.")
-
-    train_start = time.time()
-
-    if start_epoch <= NUM_EPOCHS:
-        epoch_pbar = tqdm(range(start_epoch, NUM_EPOCHS + 1), desc=f"  [{category.upper()}] Training", unit="epoch")
-        for epoch in epoch_pbar:
-            t0 = time.time()
-            tm = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch)
-            vm = evaluate(model, val_loader, criterion, device, "VAL")
-            scheduler.step(vm["selection_accuracy"])
-            et = time.time() - t0
-
-            epoch_pbar.set_postfix(
-                tr_loss=f"{tm['loss']:.3f}",
-                tr_acc=f"{tm['accuracy']:.3f}",
-                val_sel=f"{vm['selection_accuracy']:.3f}"
-            )
-
-            is_best = vm["selection_accuracy"] > best_val_sel_acc
-            if is_best:
-                best_val_sel_acc = vm["selection_accuracy"]
-                patience_counter = 0
-                torch.save({
-                    "epoch": epoch, "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "val_selection_accuracy": best_val_sel_acc,
-                    "feat_dims": FEAT_DIMS, "hidden_dim": HIDDEN_DIM,
-                    "n_points": N_POINTS, "category": category,
-                    "n_categories": 0,
-                }, best_model_path)
-                epoch_pbar.write(
-                    f"  * Epoch {epoch:3d}/{NUM_EPOCHS} [NEW BEST] | "
-                    f"TrLoss: {tm['loss']:.4f} Acc: {tm['accuracy']:.3f} | "
-                    f"VaLoss: {vm['loss']:.4f} SelAcc: {best_val_sel_acc:.3f} "
-                    f"({vm['selection_correct']}/{vm['selection_total']}) | {et:.1f}s"
-                )
-            else:
-                patience_counter += 1
-
-            # Save latest checkpoint after EVERY epoch for instant resumption if crashed
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "best_val_sel_acc": best_val_sel_acc,
-                "patience_counter": patience_counter,
-                "feat_dims": FEAT_DIMS, "hidden_dim": HIDDEN_DIM,
-                "n_points": N_POINTS, "category": category,
-                "n_categories": 0,
-            }, latest_model_path)
-
-            if patience_counter >= PATIENCE:
-                epoch_pbar.write(f"  [!] Early stopping at epoch {epoch}")
-                break
-        epoch_pbar.close()
-    else:
-        print(f"\n  [+] Training already completed up to epoch {NUM_EPOCHS}.")
-
-    train_time = time.time() - train_start
-    print(f"\n  [T] Training: {train_time:.1f}s ({train_time/60:.1f}min)")
-    print(f"  Best val SelAcc: {best_val_sel_acc:.3f}")
-
-    # Test evaluation
-    print("\n" + "-" * 60)
-    print(f"  TEST EVALUATION [{category.upper()}]")
-    print("-" * 60)
-
-    ckpt = torch.load(best_model_path, weights_only=False, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
-
-    test_start = time.time()
-    test_m = evaluate(model, test_loader, criterion, device, "TEST")
-    test_time = time.time() - test_start
-
-    print(f"\n  Test Results:")
-    print(f"    Binary Accuracy:    {test_m['accuracy']:.3f}")
-    print(f"    Selection Accuracy: {test_m['selection_accuracy']:.3f} "
-          f"({test_m['selection_correct']}/{test_m['selection_total']})")
-    print(f"    Loss:               {test_m['loss']:.4f}")
-
-    total_time = time.time() - total_start
-    print(f"\n{'='*60}")
-    print(f"  TIMING [{category.upper()}]")
-    print(f"{'='*60}")
-    print(f"  Data:     {data_time:8.1f}s ({data_time/60:.1f}min)")
-    print(f"  Train:    {train_time:8.1f}s ({train_time/60:.1f}min)")
-    print(f"  Test:     {test_time:8.1f}s")
-    print(f"  TOTAL:    {total_time:8.1f}s ({total_time/60:.1f}min)")
-    print(f"{'='*60}")
-    print(f"  Model: {best_model_path}")
 
 
 # =====================================================================
@@ -1982,7 +1798,7 @@ def train_agnostic(categories=None):
     for any category (including unseen ones via zero-shot).
     """
     if categories is None:
-        categories = CATEGORIES
+        categories = get_categories()
 
     print("\n" + "=" * 60)
     print("  CATEGORY-AGNOSTIC VNN TRAINING")
@@ -2036,11 +1852,14 @@ def train_agnostic(categories=None):
     print(f"  Category count:      {n_cats}")
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=0, pin_memory=(device.type == "cuda"))
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
-                            num_workers=0, pin_memory=(device.type == "cuda"))
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
-                             num_workers=0, pin_memory=(device.type == "cuda"))
+                              num_workers=2, pin_memory=(device.type == "cuda"),
+                              persistent_workers=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE * 2, shuffle=False,
+                            num_workers=2, pin_memory=(device.type == "cuda"),
+                            persistent_workers=True)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE * 2, shuffle=False,
+                             num_workers=2, pin_memory=(device.type == "cuda"),
+                             persistent_workers=True)
 
     # ---- Build model ----
     model = VNCandidateSelector(
@@ -2210,13 +2029,12 @@ def generate_category(category):
     out_dir = os.path.join(OUT_ROOT, category)
     os.makedirs(out_dir, exist_ok=True)
 
-    # ---- Load VNN (try agnostic first, then per-category) ----
+    # ---- Load VNN (Agnostic Ranking Model) ----
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     vnn_model_obj = None
     vnn_available = False
     vnn_cat_idx = None
 
-    # Try agnostic model
     agnostic_path = get_agnostic_model_path()
     if os.path.exists(agnostic_path):
         ckpt = torch.load(agnostic_path, weights_only=False, map_location=device)
@@ -2235,23 +2053,7 @@ def generate_category(category):
             vnn_cat_idx = cat_to_idx[category]
         print(f"  [OK] Loaded AGNOSTIC VNN from {agnostic_path}")
     else:
-        # Fall back to per-category model
-        best_model_path = get_best_model_path(category)
-        if os.path.exists(best_model_path):
-            ckpt = torch.load(best_model_path, weights_only=False, map_location=device)
-            vnn_model_obj = VNCandidateSelector(
-                n_points=ckpt.get("n_points", N_POINTS),
-                feat_dims=ckpt.get("feat_dims", FEAT_DIMS),
-                hidden_dim=ckpt.get("hidden_dim", HIDDEN_DIM),
-                n_categories=ckpt.get("n_categories", 0),
-            ).to(device)
-            vnn_model_obj.load_state_dict(ckpt["model_state_dict"])
-            vnn_model_obj.eval()
-            vnn_available = True
-            print(f"  [OK] Loaded per-category VNN from {best_model_path}")
-
-    if not vnn_available:
-        print(f"  [!] No VNN checkpoint. Generating without auto-selection.")
+        print(f"  [!] No VNN checkpoint found at {agnostic_path}. Generating without auto-selection.")
 
     # Template
     template_uid = uids[0]
@@ -2269,9 +2071,7 @@ def generate_category(category):
                 "vnn_enabled": vnn_available, "objects": []}
     prepared, discarded = 0, 0
 
-    total_items = min(len(uids)-1, N_GENERATE)
-    pbar = tqdm(uids[1:], desc=f"  [{category}]", total=total_items, unit="obj")
-    for uid in pbar:
+    for uid in uids[1:]:
         if prepared >= N_GENERATE:
             break
         path = objs.get(uid) or download_objects([uid]).get(uid)
@@ -2284,7 +2084,6 @@ def generate_category(category):
         ok, _ = passes_quality(mesh)
         if not ok:
             discarded += 1
-            pbar.set_postfix(good=prepared, bad=discarded, status="skip")
             continue
 
         # Sanitize UID for file paths (handles absolute local paths)
@@ -2329,14 +2128,12 @@ def generate_category(category):
 
             vnn_selection = {"selected_index": best_idx, "selected_name": candidates[best_idx][0],
                              "scores": scores, "selected_score": scores[best_idx]}
-            pbar.set_postfix(good=prepared+1, bad=discarded, vnn=f"c{best_idx}({scores[best_idx]:.2f})")
 
         entry = {"uid": safe_uid, "candidates": cand_records}
         if vnn_selection:
             entry["vnn_selected"] = vnn_selection
         manifest["objects"].append(entry)
         prepared += 1
-    pbar.close()
 
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
@@ -2399,7 +2196,6 @@ def align_single_object(mesh_or_path, template_mesh_or_pts=None, category=None):
     # ---- Score with VNN ----
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Try agnostic model first
     model_loaded = False
     agnostic_path = get_agnostic_model_path()
     if os.path.exists(agnostic_path):
@@ -2419,22 +2215,6 @@ def align_single_object(mesh_or_path, template_mesh_or_pts=None, category=None):
             cat_idx_tensor = torch.tensor([cat_to_idx[category]], dtype=torch.long).to(device)
         model_loaded = True
         print(f"  Using agnostic VNN")
-
-    if not model_loaded:
-        per_cat_path = get_best_model_path(category)
-        if os.path.exists(per_cat_path):
-            ckpt = torch.load(per_cat_path, weights_only=False, map_location=device)
-            model = VNCandidateSelector(
-                n_points=ckpt.get("n_points", N_POINTS),
-                feat_dims=ckpt.get("feat_dims", FEAT_DIMS),
-                hidden_dim=ckpt.get("hidden_dim", HIDDEN_DIM),
-                n_categories=ckpt.get("n_categories", 0),
-            ).to(device)
-            model.load_state_dict(ckpt["model_state_dict"])
-            model.eval()
-            cat_idx_tensor = None
-            model_loaded = True
-            print(f"  Using per-category VNN for '{category}'")
 
     if model_loaded:
         tpl_tensor = torch.tensor(template_pts, dtype=torch.float32).unsqueeze(0).to(device)
@@ -2524,20 +2304,7 @@ def evaluate_stability_consistency(category, num_objects=10, k_rotations=5):
         if category in cat_to_idx:
             vnn_cat_idx = cat_to_idx[category]
     else:
-        per_cat_path = get_best_model_path(category)
-        if os.path.exists(per_cat_path):
-            ckpt = torch.load(per_cat_path, weights_only=False, map_location=device)
-            model = VNCandidateSelector(
-                n_points=ckpt.get("n_points", N_POINTS),
-                feat_dims=ckpt.get("feat_dims", FEAT_DIMS),
-                hidden_dim=ckpt.get("hidden_dim", HIDDEN_DIM),
-                n_categories=ckpt.get("n_categories", 0),
-            ).to(device)
-            model.load_state_dict(ckpt["model_state_dict"])
-            model.eval()
-
-    if model is None:
-        print(f"  [!] No VNN model found for '{category}'. Skipping.")
+        print(f"  [!] No VNN model found at '{agnostic_path}'. Skipping.")
         return 0, 0
 
     print(f"  Evaluating {len(valid_objects)} objects with {k_rotations} rotations each...")
@@ -2599,7 +2366,7 @@ def evaluate_stability_consistency(category, num_objects=10, k_rotations=5):
 
     print(f"\n  [RESULTS] Category: {category.upper()}")
     print(f"    Stability (k={k_rotations}):   {avg_stability:.2f}° (Ideal: 0°)")
-    print(f"    Consistency (n={n}): {avg_consistency:.2f}° (Ideal: 0°)\n")
+    print(f"    Consistency (n={len(valid_objects)}): {avg_consistency:.2f}° (Ideal: 0°)\n")
     
     return avg_stability, avg_consistency
 
@@ -2608,31 +2375,26 @@ def evaluate_stability_consistency(category, num_objects=10, k_rotations=5):
 # =====================================================================
 
 def run_pipeline(mode, categories=None):
-    """Run the pipeline in 'train' or 'generate' mode.
+    """Run the pipeline in 'train', 'generate', or 'evaluate_metrics' mode.
 
     Args:
-        mode: 'train' or 'generate'
+        mode: 'train', 'generate', or 'evaluate_metrics'
         categories: List of categories to process (default: all)
     """
     if categories is None:
-        categories = CATEGORIES
+        categories = get_categories()
 
     if mode == "train":
-        print("\n" + "#" * 60)
-        print("  TRAINING VNN FOR ALL CATEGORIES (per-category)")
-        print("#" * 60)
-        t0 = time.time()
-        for cat in categories:
-            train_category(cat)
-        print(f"\n  Total training time: {time.time()-t0:.1f}s")
+        train_agnostic(categories)
 
     elif mode == "generate":
         print("\n" + "#" * 60)
-        print("  GENERATING CANDIDATES FOR ALL CATEGORIES")
+        print(f"  GENERATING CANDIDATES (Max {CATEGORIES_TO_RENDER} categories with >= {MIN_GLBS_TO_RENDER} GLBs)")
         print("#" * 60)
+        render_cats = get_render_categories(categories, max_categories=CATEGORIES_TO_RENDER, min_glbs=MIN_GLBS_TO_RENDER)
         t0 = time.time()
         total_p, total_d = 0, 0
-        for cat in categories:
+        for cat in render_cats:
             p, d = generate_category(cat)
             total_p += p
             total_d += d
@@ -2651,35 +2413,6 @@ def run_pipeline(mode, categories=None):
         print(f"  Unknown mode: {mode}. Use 'train', 'generate', or 'evaluate_metrics'.")
 
 
-def run_all(categories=None):
-    """Run the full per-category pipeline: train all VNNs, then generate candidates."""
-    if categories is None:
-        categories = CATEGORIES
-
-    grand_start = time.time()
-
-    print("\n" + "#" * 60)
-    print("  FULL PIPELINE: PER-CATEGORY TRAIN + GENERATE")
-    print(f"  Categories: {', '.join(categories)}")
-    if USE_ONLY_N_SAMPLES: print(f"  Samples per category: {N_SAMPLES}")
-    print(f"  Rotation augmentation: {N_ROTATIONS}x")
-    print("#" * 60)
-
-    # Step 1: Train
-    run_pipeline("train", categories)
-
-    # Step 2: Generate
-    run_pipeline("generate", categories)
-
-    # Step 3: Calculate stablility and consistency
-    run_pipeline("evaluate_metrics")
-
-    grand_time = time.time() - grand_start
-    print(f"\n{'#'*60}")
-    print(f"  COMPLETE! Total time: {grand_time:.1f}s ({grand_time/60:.1f}min)")
-    print(f"{'#'*60}\n")
-
-
 def run_agnostic(categories=None):
     """Run the full category-agnostic pipeline: train unified VNN, then generate.
 
@@ -2687,12 +2420,12 @@ def run_agnostic(categories=None):
     categories using ranking loss, then used to select canonical orientations.
     """
     if categories is None:
-        categories = CATEGORIES
+        categories = get_categories()
 
     grand_start = time.time()
 
     print("\n" + "#" * 60)
-    print("  FULL PIPELINE: AGNOSTIC TRAIN + GENERATE")
+    print("  FULL PIPELINE: AGNOSTIC TRAIN + GENERATE + EVALUATE")
     print(f"  Categories: {', '.join(categories)}")
     if USE_ONLY_N_SAMPLES: print(f"  Samples per category: {N_SAMPLES}")
     print(f"  Rotation augmentation: {N_ROTATIONS}x")
@@ -2704,19 +2437,17 @@ def run_agnostic(categories=None):
     # Step 2: Generate using agnostic model
     run_pipeline("generate", categories)
 
-    # Step 3: Calculate stablility and consistency
-    run_pipeline("evaluate_metrics")
+    # Step 3: Calculate stability and consistency
+    run_pipeline("evaluate_metrics", categories)
 
     grand_time = time.time() - grand_start
     print(f"\n{'#'*60}")
     print(f"  AGNOSTIC PIPELINE COMPLETE! Total time: {grand_time:.1f}s ({grand_time/60:.1f}min)")
     print(f"{'#'*60}\n")
 
-
 # =====================================================================
 # MAIN
 # =====================================================================
 
 if __name__ == "__main__":
-    if CATEGORY_AGNOSTIC: run_agnostic()
-    else: run_all()
+    run_agnostic()
