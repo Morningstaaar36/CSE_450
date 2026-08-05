@@ -7,7 +7,7 @@ Complete self-contained pipeline for training and using a Vector Neuron
 Network (VNN) for automatic canonical orientation selection of 3D objects.
 
 Implements the full CanoVerse paper method:
-  - Semantic part segmentation (Sparse Spectral Graph Decomposition as Find3D proxy)
+  - Geometric part segmentation (Sparse Spectral Graph Decomposition as Find3D proxy)
   - Proper support-surface vertical alignment (Rodrigues rotation + stability)
   - PCA vertical with semantic part disambiguation (Eq. 1-2)
   - Joint semantic-geometric horizontal alignment (Eq. 4)
@@ -37,6 +37,9 @@ Or run individual steps:
 # Categories to process (leave empty to dynamically discover from dataset)
 CATEGORIES = []
 
+# Maximum categories to process (None = run on all categories, integer N = run only on first N categories)
+MAX_CATEGORIES = None
+
 # Limit training samples per category to N_SAMPLES (True) or sample ALL existing point clouds (False)
 USE_ONLY_N_SAMPLES = False
 
@@ -47,20 +50,19 @@ N_SAMPLES = 20
 N_GENERATE = 5
 
 # Candidate rendering & generation settings
-CATEGORIES_TO_RENDER = 15   # Max number of categories to generate/render candidates for
+CATEGORIES_TO_RENDER = 12   # Max number of categories to generate/render candidates for
 MIN_GLBS_TO_RENDER = 100    # Each category chosen for rendering must contain at least 100 GLB files
 
 # Point cloud settings
 N_POINTS = 1024          # Points sampled per mesh surface (consistent everywhere)
 
-# Rotation augmentation: 3 rotations is sufficient since VN-DGCNN is already equivariant,
-# so augmentation is mainly for regularization, not for teaching invariance.
-N_ROTATIONS = 3
+# Rotation augmentation: VN-DGCNN is already equivariant, so augmentation is mainly for regularization, not for teaching invariance.
+N_ROTATIONS = 1
 
 # Training hyperparameters
-BATCH_SIZE = 4           # Micro-batch size to fit in memory
-GRAD_ACCUM_STEPS = 8     # Effective batch size = 4 * 8 = 32
-NUM_EPOCHS = 100          # Max training epochs (early stopping will kick in)
+BATCH_SIZE = 8           # Micro-batch size (raised from 4 via memory optimizations)
+GRAD_ACCUM_STEPS = 4     # Effective batch size = 8 * 4 = 32
+NUM_EPOCHS = 200          # Max training epochs (early stopping will kick in)
 LEARNING_RATE = 1e-3     # Adam learning rate
 WEIGHT_DECAY = 1e-4      # L2 regularization
 PATIENCE = 20            # Early stopping patience
@@ -78,11 +80,10 @@ VAL_RATIO = 0.15
 TEST_RATIO = 0.15
 
 # Candidate generation
-THETA_STEPS = 72         # Horizontal rotation search resolution (was 180; 5-deg steps still precise)
+THETA_STEPS = 36         # Horizontal rotation search resolution (was 180; 10-deg steps still precise)
 RENDER_SIZE = 320        # Render image dimensions (pixels, square)
 
 # Semantic part segmentation (Sparse Spectral Graph Decomposition)
-N_SEMANTIC_PARTS = 6          # Number of semantic part clusters
 CENTROID_MATCH_WEIGHT = 0.2   # Weight balancing Chamfer distance vs spatial centroid alignment in Hungarian matching
 
 # Quality gate
@@ -123,13 +124,14 @@ import time
 import math
 from collections import defaultdict
 
-for pkg in ["trimesh", "transformers", "pyrender"]:
+for pkg in ["trimesh", "transformers", "pyrender", "fast-simplification"]:
     try:
-        __import__(pkg)
+        __import__(pkg.replace("-", "_"))
     except ImportError:
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
         except Exception:
+            print("Could NOT install", pkg)
             pass
 
 import numpy as np
@@ -150,6 +152,7 @@ from tqdm import tqdm
 os.environ.pop("PYOPENGL_PLATFORM", None)
 
 _DATASET_INDEX = None
+_DISCOVERED_ALL_CATEGORIES = None
 
 
 def find_dataset_root():
@@ -227,20 +230,26 @@ def get_dataset_index():
 
 def get_categories():
     """Dynamically discover available categories from local CanoVerse GLB dataset."""
-    global CATEGORIES
+    global CATEGORIES, _DISCOVERED_ALL_CATEGORIES
     if CATEGORIES:
-        return CATEGORIES
-        
-    index = get_dataset_index()
-    CATEGORIES = sorted(list(index.keys()))
-    
-    if not CATEGORIES:
-        print("  [WARNING] No CanoVerse categories found at dataset path!")
-        raise ValueError("No categories found in dataset directory!")
+        cats = list(CATEGORIES)
+    elif _DISCOVERED_ALL_CATEGORIES is not None:
+        cats = list(_DISCOVERED_ALL_CATEGORIES)
     else:
-        print(f"\n  [INFO] Dynamically discovered {len(CATEGORIES)} CanoVerse categories: {CATEGORIES}\n")
+        index = get_dataset_index()
+        cats = sorted(list(index.keys()))
         
-    return CATEGORIES
+        if not cats:
+            print("  [WARNING] No CanoVerse categories found at dataset path!")
+            raise ValueError("No categories found in dataset directory!")
+        _DISCOVERED_ALL_CATEGORIES = list(cats)
+        print(f"\n  [INFO] Dynamically discovered {len(cats)} CanoVerse categories: {cats}\n")
+
+    if MAX_CATEGORIES is not None and isinstance(MAX_CATEGORIES, int) and MAX_CATEGORIES > 0:
+        cats = cats[:MAX_CATEGORIES]
+        print(f"  [INFO] MAX_CATEGORIES={MAX_CATEGORIES}: Running on first {len(cats)} categories: {cats}\n")
+        
+    return cats
 
 
 def sample_surface_points(geometry, n=5000):
@@ -278,10 +287,12 @@ def load_mesh_or_pc(path):
     if hasattr(mesh, 'vertices') and len(mesh.vertices) > MAX_GLB_VERTS:
         if hasattr(mesh, 'faces') and len(mesh.faces) > 0:
             try:
-                # Use quadric decimation to reduce polygon count while keeping faces intact
-                mesh = mesh.simplify_quadric_decimation(MAX_GLB_VERTS)
-            except Exception:
+                # face_count= kwarg required in trimesh >= 4.x (positional arg is `percent`, not face_count)
+                target_faces = min(len(mesh.faces), MAX_GLB_VERTS)
+                mesh = mesh.simplify_quadric_decimation(face_count=target_faces)
+            except Exception as e:
                 # Fallback: surface point sampling with normals
+                print(f"  [decimate] failed ({type(e).__name__}: {e}) — falling back to point sampling")
                 pts, face_idx = trimesh.sample.sample_surface(mesh, MAX_GLB_VERTS)
                 normals = mesh.face_normals[face_idx] if hasattr(mesh, 'face_normals') and len(mesh.face_normals) > 0 else np.zeros_like(pts)
                 mesh = trimesh.Trimesh(vertices=pts, vertex_normals=normals)
@@ -348,10 +359,10 @@ class VNLeakyReLU(nn.Module):
         if self.share:
             q_norm = q_norm.expand_as(x)
         proj = (x * q_norm).sum(dim=-1, keepdim=True)
-        mask = (proj >= 0).float()
-        x_out = mask * x + (1 - mask) * (
-            x - (1.0 - self.negative_slope) * proj * q_norm
-        )
+        # Memory-efficient formulation: replaces 5 intermediate boolean mask/product tensors
+        # with a single clamp operation, identical mathematical output with ~60% less VRAM.
+        proj_neg = torch.clamp(proj, max=0.0)
+        x_out = x - ((1.0 - self.negative_slope) * proj_neg) * q_norm
         return x_out
 
 
@@ -389,7 +400,10 @@ class VNChannelAttention(nn.Module):
 
 
 class VNStdFeature(nn.Module):
-    """Extract rotation-INVARIANT scalar features from equivariant vectors."""
+    """Extract rotation-INVARIANT scalar features from equivariant vectors.
+    Normalizes input vectors so Gram matrix entries are bounded cosine similarities in [-1, 1],
+    preventing quadratic magnitude explosion and feature scale drift.
+    """
     def __init__(self, in_channels):
         super().__init__()
         self.in_channels = in_channels
@@ -399,19 +413,25 @@ class VNStdFeature(nn.Module):
         self.register_buffer("tri_col", idx[1])
 
     def forward(self, x):
-        gram = torch.bmm(x, x.transpose(1, 2))
+        # x: (B, C, 3)
+        # Normalize each 3D vector by its L2 norm: $\|R v\| = \|v\|$, so output is strictly SO(3)-invariant
+        # and Gram matrix entries become bounded cosine similarities $\cos \theta_{ij} \in [-1, 1]$.
+        norms = torch.norm(x, dim=-1, keepdim=True) + 1e-8
+        x_norm = x / norms
+        gram = torch.bmm(x_norm, x_norm.transpose(1, 2))  # (B, C, C) bounded in [-1, 1]
         invariant = gram[:, self.tri_row, self.tri_col]
         return invariant
 
 
 def knn_distance_invariant(x, k):
     """SO(3)-invariant KNN based on inner products of vector features.
-    x: (B, C, 3, N) -> returns indices (B, N, k)
+    x: (B, C, 3, N) -> returns indices (B, N, k) excluding self.
     """
     inner = torch.einsum('bcdn,bcdm->bnm', x, x) # (B, N, N)
     x2 = torch.diagonal(inner, dim1=1, dim2=2).unsqueeze(2) # (B, N, 1)
     dist = x2 + x2.transpose(1, 2) - 2 * inner
-    idx = dist.topk(k=k, dim=-1, largest=False)[1] # (B, N, k)
+    # k+1 nearest neighbors, slicing [..., 1:] to exclude distance-to-self (index 0)
+    idx = dist.topk(k=k + 1, dim=-1, largest=False)[1][..., 1:] # (B, N, k)
     return idx
 
 def get_vn_graph_feature(x, k=20, idx=None):
@@ -494,7 +514,11 @@ class VNDGCNNEncoder(nn.Module):
         x = points.unsqueeze(1).permute(0, 1, 3, 2) # (B, 1, 3, N)
         layer_outputs = []
         for layer in self.layers:
-            x, _ = layer(x, idx=None)  # Recompute graph dynamically
+            if self.training and x.requires_grad:
+                # Gradient checkpointing: frees EdgeConv intermediates during forward pass
+                x, _ = torch.utils.checkpoint.checkpoint(layer, x, None, use_reentrant=False)
+            else:
+                x, _ = layer(x, idx=None)
             layer_outputs.append(x)    # Each is (B, C_i, 3, N)
             
         # Concatenate multi-scale features: (B, sum(C_i), 3, N)
@@ -554,6 +578,7 @@ class VNCandidateSelector(nn.Module):
             head_input_dim += category_embed_dim
 
         self.head = nn.Sequential(
+            nn.LayerNorm(head_input_dim),
             nn.Linear(head_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
@@ -621,35 +646,44 @@ class VNCandidateSelector(nn.Module):
         score = self.head(inv_feat)
         return score
 
-    def forward_all_candidates(self, template_pts, candidates_pts, category_idx=None):
-        """Score all K candidates in a single vectorized encoder call.
+    def forward_all_candidates(self, template_pts, candidates_pts, category_idx=None, chunk_size=10):
+        """Score all K candidates with chunked encoding to prevent peak VRAM spikes.
 
-        Instead of encoding each candidate separately in a Python loop (K passes),
-        this reshapes (B, K, N, 3) -> (B*K, N, 3), encodes everything in ONE pass,
-        then reshapes back. Reduces encoder calls from K+1 to 2.
+        Instead of encoding all B*K point clouds in one monolithic tensor, this
+        chunks candidate encoding into groups of size <= chunk_size (default 10),
+        capping peak EdgeConv activation memory.
 
         Args:
             template_pts:   (B, N, 3)
             candidates_pts: (B, K, N, 3)
             category_idx:   (B,) LongTensor, optional
+            chunk_size:     max candidate point clouds to encode in one sub-batch
         Returns:
             logits: (B, K) raw scores for each candidate
         """
         B, K, N, _ = candidates_pts.shape
 
-        # Encode template once: (B, C, 3)
+        # 1. Encode template once: (B, C, 3)
         feat_t = self.encoder(template_pts)
 
-        # Encode all K candidates in a single pass: reshape to (B*K, N, 3)
+        # 2. Encode candidates in chunks to cap peak EdgeConv activation memory
         cands_flat = candidates_pts.reshape(B * K, N, 3)
-        feat_c_flat = self.encoder(cands_flat)   # (B*K, C, 3)
+        if B * K <= chunk_size:
+            feat_c_flat = self.encoder(cands_flat)
+        else:
+            feat_c_chunks = []
+            for start in range(0, B * K, chunk_size):
+                end = min(start + chunk_size, B * K)
+                feat_c_chunks.append(self.encoder(cands_flat[start:end]))
+            feat_c_flat = torch.cat(feat_c_chunks, dim=0)
+
         feat_c = feat_c_flat.reshape(B, K, -1, 3)  # (B, K, C, 3)
 
-        # Expand template to (B, K, C, 3) and concat
+        # 3. Expand template to (B, K, C, 3) and concat
         feat_t_exp = feat_t.unsqueeze(1).expand(B, K, -1, 3)
         combined_eq = torch.cat([feat_t_exp, feat_c], dim=2)  # (B, K, 2C, 3)
 
-        # Flatten B*K for reducer and invariant
+        # 4. Flatten B*K for reducer and invariant
         C2 = combined_eq.shape[2]
         combined_flat = combined_eq.reshape(B * K, C2, 3)
         reduced_flat = self.reducer(combined_flat)       # (B*K, reduce_dim, 3)
@@ -803,6 +837,41 @@ def random_rotation_matrix_torch(device="cpu"):
     return R
 
 
+def random_realistic_input_rotation(p_azimuth=0.60, p_tilted=0.20):
+    """Sample realistic input orientation for training dataset preparation.
+    
+    Prevents the 5-way classification problem from collapsing into a 2-way 
+    problem (candidates 3 and 4 only) under 100% full SO(3) rotation.
+    
+    Distribution:
+      - 60%: Random azimuth (yaw) rotation rot_y(theta) [tests candidates 0, 1, 2].
+      - 20%: Azimuth + small random tilt (±15-25 deg) [tests robustness & PCA].
+      - 20%: Full SO(3) tumble [tests candidates 3 & 4 (Support & PCA vertical)].
+    """
+    u = float(np.random.random())
+    if u < p_azimuth:
+        # Pure horizontal azimuth rotation
+        theta = float(np.random.uniform(0, 2 * np.pi))
+        return rot_y(theta).astype(np.float32)
+    elif u < p_azimuth + p_tilted:
+        # Azimuth + mild random tilt (±25 degrees)
+        theta = float(np.random.uniform(0, 2 * np.pi))
+        R_yaw = rot_y(theta)
+        tilt = float(np.random.uniform(np.radians(-25), np.radians(25)))
+        phi = float(np.random.uniform(0, 2 * np.pi))
+        axis = np.array([np.cos(phi), 0.0, np.sin(phi)], dtype=np.float32)
+        K = np.array([
+            [0, -axis[2], axis[1]],
+            [axis[2], 0, -axis[0]],
+            [-axis[1], axis[0], 0]
+        ], dtype=np.float32)
+        R_tilt = np.eye(3, dtype=np.float32) + np.sin(tilt) * K + (1.0 - np.cos(tilt)) * (K @ K)
+        return (R_tilt @ R_yaw).astype(np.float32)
+    else:
+        # Full random SO(3) tumble
+        return random_rotation_matrix().astype(np.float32)
+
+
 def normalize_to_unit_sphere(mesh):
     """Centre mesh at geometric center and scale to fit inside a unit sphere.
     
@@ -911,13 +980,30 @@ def chamfer_distance(a, b, na=None, nb=None, alpha=0.5):
             return cd_val + alpha * normal_loss
         return cd_val
 
-
 def chamfer_distance_fast(a, b, tree_b=None, max_pts=256):
     """Fast approximate Chamfer using subsampled point clouds + optional pre-built KDTree.
+    Uses GPU (torch.cdist) when available and tree_b is not pre-built.
+    Falls back to CPU cKDTree when tree_b is provided (pre-built case) or GPU is unavailable.
     Used during alignment search (geometric/semantic_horizontal) where many calls are made.
+
+    NOTE: Callers are responsible for pre-subsampling `a` ONCE before calling in a loop.
+    This function no longer randomly subsamples `a` internally to avoid comparing energies
+    computed on different data across multiple calls.
     """
-    if len(a) > max_pts:
-        a = a[np.random.choice(len(a), max_pts, replace=False)]
+    # GPU-accelerated path: only viable when no pre-built KDTree is provided
+    if tree_b is None and torch.cuda.is_available():
+        try:
+            b_sub = b[np.random.choice(len(b), max_pts, replace=False)] if len(b) > max_pts else b
+            a_t = torch.as_tensor(a, dtype=torch.float32, device="cuda")
+            b_t = torch.as_tensor(b_sub, dtype=torch.float32, device="cuda")
+            dists = torch.cdist(a_t.unsqueeze(0), b_t.unsqueeze(0)).squeeze(0)  # (N_a, N_b)
+            d_ab = dists.min(dim=1).values.mean().item()
+            d_ba = dists.min(dim=0).values.mean().item()
+            return float(d_ab + d_ba)
+        except (torch.cuda.OutOfMemoryError, RuntimeError):
+            pass  # Fall through to CPU path
+
+    # CPU fallback path (or pre-built tree path)
     if tree_b is None:
         if len(b) > max_pts:
             b = b[np.random.choice(len(b), max_pts, replace=False)]
@@ -999,15 +1085,15 @@ class SpectralPartSegmenter:
                     cls._instance = SpectralPartSegmenter()
         return cls._instance
 
-    def compute_features(self, points, k_neighbors=16, n_components=6):
+    def compute_features(self, points, k_neighbors=16, n_components=None):
         """Compute fast, deterministic, sparse geometric spectral features (Laplacian eigenvectors + spatial coordinates).
         
-        Uses sparse matrix operations (csr_matrix and ARPACK eigsh) for O(N*k) computational
-        complexity and O(N*k) memory, scaling efficiently to large point clouds.
+        If n_components is None, determines the optimal part count adaptively from the Laplacian eigengap
+        heuristic: argmax_{k in [3, 8]} (lambda_{k+1} - lambda_k).
         """
         N = len(points)
         if N < 8:
-            return points
+            return points, 1
             
         tree = cKDTree(points)
         k_eff = min(k_neighbors, N - 1)
@@ -1027,26 +1113,47 @@ class SpectralPartSegmenter:
         
         L_sym = speye(N, dtype=np.float32, format='csr') - D_inv_sqrt @ W @ D_inv_sqrt
         
-        n_comp = min(n_components, max(1, N - 2))
+        k_max_eig = min(9, max(4, N - 2))
         try:
-            evals, evecs = eigsh(L_sym, k=n_comp + 1, which='SM', tol=1e-3, maxiter=200)
+            evals, evecs = eigsh(L_sym, k=k_max_eig + 1, which='SM', tol=1e-3, maxiter=200)
+            idx_sort = np.argsort(evals)
+            evals = evals[idx_sort]
+            evecs = evecs[:, idx_sort]
+            
+            if n_components is None:
+                # Eigengap heuristic: find k in [3, min(8, k_max_eig-1)] maximizing lambda_{k+1} - lambda_k
+                k_min_cand = 3
+                k_max_cand = min(8, k_max_eig - 1)
+                if k_max_cand >= k_min_cand:
+                    gaps = np.diff(evals[1:k_max_cand + 2])
+                    best_offset = int(np.argmax(gaps[k_min_cand - 1:k_max_cand]))
+                    n_comp = k_min_cand + best_offset
+                else:
+                    n_comp = k_min_cand
+            else:
+                n_comp = min(n_components, k_max_eig)
+                
             spectral_emb = evecs[:, 1:n_comp + 1]
         except Exception:
+            n_comp = 6 if n_components is None else min(n_components, 6)
             spectral_emb = np.zeros((N, n_comp), dtype=np.float32)
 
         center = points.mean(axis=0)
         norm_coords = (points - center) / (np.linalg.norm(points - center, axis=1).max() + 1e-8)
         radius = np.linalg.norm(norm_coords, axis=1, keepdims=True)
         
-        return np.concatenate([norm_coords, radius, spectral_emb], axis=-1).astype(np.float32)
+        features = np.concatenate([norm_coords, radius, spectral_emb], axis=-1).astype(np.float32)
+        return features, n_comp
 
-    def segment(self, points, n_parts=N_SEMANTIC_PARTS):
-        """Segment point cloud into semantic parts using Sparse Spectral Graph Decomposition."""
-        if len(points) < n_parts or n_parts <= 1:
+    def segment(self, points, n_parts=None):
+        """Segment point cloud into semantic parts using Sparse Spectral Graph Decomposition with adaptive eigengap."""
+        if len(points) < 4:
             return [points]
 
-        effective_n_parts = min(n_parts, max(1, len(points) // 4))
-        combined_rep = self.compute_features(points, n_components=effective_n_parts)
+        target_n_parts = n_parts if (n_parts is not None and isinstance(n_parts, int)) else None
+        combined_rep, auto_k = self.compute_features(points, n_components=target_n_parts)
+        effective_n_parts = target_n_parts if target_n_parts is not None else auto_k
+        effective_n_parts = max(2, min(effective_n_parts, len(points) // 4))
 
         try:
             km = MiniBatchKMeans(
@@ -1072,18 +1179,17 @@ class SpectralPartSegmenter:
 
 
 def segment_semantic_parts(points, n_parts=None):
-    """Segment a point cloud into semantic parts via Spectral Graph Decomposition."""
-    if n_parts is None:
-        n_parts = N_SEMANTIC_PARTS
+    """Segment a point cloud into semantic parts via Spectral Graph Decomposition (adaptive eigengap by default)."""
     return SpectralPartSegmenter.get_instance().segment(points, n_parts=n_parts)
 
 
-def match_parts_chamfer(parts_a, parts_b, max_pts=256, centroid_weight=CENTROID_MATCH_WEIGHT):
+def match_parts_chamfer(parts_a, parts_b, max_pts=256, centroid_weight=CENTROID_MATCH_WEIGHT, trees_a=None):
     """Match two sets of semantic parts using optimal bipartite matching (Hungarian algorithm)
     and return the average per-part Chamfer distance.
     
     Args:
         centroid_weight: Weight balancing local per-part Chamfer distance with global spatial centroid alignment.
+        trees_a: Optional prebuilt list of cKDTree for parts_a (avoids rebuilding when parts_a is fixed, e.g. template).
     """
     if not parts_a or not parts_b:
         return float("inf")
@@ -1095,8 +1201,9 @@ def match_parts_chamfer(parts_a, parts_b, max_pts=256, centroid_weight=CENTROID_
     centroids_b = [p.mean(axis=0) for p in parts_b]
     
     for i in range(na):
+        tree_ai = trees_a[i] if trees_a is not None and i < len(trees_a) else None
         for j in range(nb):
-            cd = chamfer_distance_fast(parts_a[i], parts_b[j], max_pts=max_pts)
+            cd = chamfer_distance_fast(parts_b[j], parts_a[i], tree_b=tree_ai, max_pts=max_pts)
             cent_dist = np.linalg.norm(centroids_a[i] - centroids_b[j])
             cost_matrix[i, j] = cd + centroid_weight * cent_dist
             
@@ -1126,6 +1233,7 @@ def support_vertical(mesh):
       4. Among valid stable poses, pick the most "upright" one
          (highest Y-extent and lowest centroid — replaces VLM selection).
     """
+    pts_sampled = None
     try:
         # Prevent Qhull OOM: high-res meshes will blow up Kaggle's RAM.
         # CRITICAL: Must sample uniformly by AREA, not by random vertex selection.
@@ -1142,17 +1250,43 @@ def support_vertical(mesh):
         print("Degenerate mesh found!")
         return np.eye(3)
 
-    pts = np.asarray(mesh.vertices, dtype=np.float64)
+    # Use area-weighted pts_sampled for centroid & y-extent calculations to prevent
+    # non-uniform vertex density from biasing the centroid stability test.
+    pts = pts_sampled
     n_g = np.array([0.0, -1.0, 0.0])  # ground normal (pointing down for "floor")
 
-    face_areas = hull.area_faces
-    face_order = np.argsort(face_areas)[::-1][:MAX_SUPPORT_FACES]
+    # --- Build facet groups: merge coplanar hull triangles by shared normal direction ---
+    # Testing containment against one triangle is almost always False on curved meshes.
+    # We must test against the FULL 2D footprint of every flat face (all coplanar triangles).
+    face_normals = hull.face_normals.astype(np.float64)  # (F, 3)
+    face_areas   = hull.area_faces                       # (F,)
+
+    # Group face indices by quantised normal direction (1° tolerance via rounded unit vector)
+    from collections import defaultdict as _dd
+    normal_groups = _dd(list)
+    for fi in range(len(face_normals)):
+        n = face_normals[fi]
+        nn = np.linalg.norm(n)
+        if nn < 1e-12:
+            continue
+        n_unit = (n / nn).round(2)   # quantise to ~1-degree bins
+        key = tuple(n_unit)
+        normal_groups[key].append(fi)
+
+    # Sort groups by descending total area so we evaluate the most promising bases first
+    sorted_groups = sorted(
+        normal_groups.values(),
+        key=lambda idxs: sum(face_areas[i] for i in idxs),
+        reverse=True,
+    )[:MAX_SUPPORT_FACES]
 
     stable_poses = []
     unstable_poses = []
 
-    for face_idx in face_order:
-        n_s = hull.face_normals[face_idx].astype(np.float64)
+    for face_idxs in sorted_groups:
+        # Use the area-weighted mean normal of the group
+        total_area = sum(face_areas[fi] for fi in face_idxs)
+        n_s = sum(face_normals[fi] * face_areas[fi] for fi in face_idxs) / max(total_area, 1e-12)
         n_s_norm = np.linalg.norm(n_s)
         if n_s_norm < 1e-12:
             continue
@@ -1165,24 +1299,28 @@ def support_vertical(mesh):
         rotated = (R_k @ pts.T).T
         centroid = rotated.mean(axis=0)
 
-        # Rotate face vertices for stability check
-        face_vert_indices = hull.faces[face_idx]
-        face_verts = hull.vertices[face_vert_indices].astype(np.float64)
-        rotated_face = (R_k @ face_verts.T).T
+        # Collect ALL vertices from all triangles in this facet group
+        all_vert_indices = np.unique(np.concatenate([hull.faces[fi] for fi in face_idxs]))
+        facet_verts = hull.vertices[all_vert_indices].astype(np.float64)
+        rotated_facet = (R_k @ facet_verts.T).T
+        facet_2d = rotated_facet[:, [0, 2]]  # XZ projection
 
-        # Project centroid onto the ground plane (XZ plane at face level)
+        # Build 2D convex hull of the full facet footprint and test centroid containment
         proj_2d = np.array([centroid[0], centroid[2]])
-        face_2d = rotated_face[:, [0, 2]]
+        try:
+            from scipy.spatial import ConvexHull as _CH
+            ch2d = _CH(facet_2d)
+            support_polygon = facet_2d[ch2d.vertices]
+            stable = point_in_polygon_2d(proj_2d, support_polygon)
+        except Exception:
+            # Degenerate facet (< 3 unique points) — treat as unstable
+            stable = False
 
-        stable = point_in_polygon_2d(proj_2d, face_2d)
-
-        # Score to pick the best tiebreaker within a stability class:
-        # prefer the pose with the widest base (most floor contact) and largest Y-extent (most upright).
+        # Score: prefer tall (upright) & wide-base poses as tiebreaker
         y_extent = rotated[:, 1].max() - rotated[:, 1].min()
-        base_width = np.ptp(face_2d, axis=0).mean() if len(face_2d) > 1 else 0.01
+        base_width = np.ptp(facet_2d, axis=0).mean() if len(facet_2d) > 1 else 0.01
         score = y_extent * (base_width + 0.01)
 
-        # Paper: select only from stable poses. Score is purely a tiebreaker within that set.
         if stable:
             stable_poses.append((R_k, score))
         else:
@@ -1192,10 +1330,12 @@ def support_vertical(mesh):
     candidate_poses = stable_poses if stable_poses else unstable_poses
 
     if not candidate_poses:
-        # Absolute fallback: align largest face to ground
-        largest_idx = int(np.argmax(face_areas))
-        n = hull.face_normals[largest_idx].astype(np.float64)
-        return rodrigues_rotation(n / (np.linalg.norm(n) + 1e-12), n_g)
+        # Absolute fallback: align largest face group to ground
+        largest_group = sorted_groups[0] if sorted_groups else [int(np.argmax(face_areas))]
+        n_fb = sum(face_normals[fi] * face_areas[fi] for fi in largest_group)
+        n_fb_norm = np.linalg.norm(n_fb)
+        n_fb = n_fb / max(n_fb_norm, 1e-12)
+        return rodrigues_rotation(n_fb, n_g)
 
     candidate_poses.sort(key=lambda x: x[1], reverse=True)
     return candidate_poses[0][0]
@@ -1212,8 +1352,15 @@ def pca_vertical(obj_pts, tpl_pts):
     v1t, v2t = pca_axes(tpl_pts)
     Mt = np.stack([v1t, v2t, np.cross(v1t, v2t)], axis=1)
 
-    # Segment template into semantic parts (once)
+    # Segment template and object into semantic parts (done ONCE)
     tpl_parts = segment_semantic_parts(tpl_pts)
+    obj_parts_base = segment_semantic_parts(obj_pts)
+
+    # Prebuild template trees once
+    tpl_part_trees = []
+    for p in tpl_parts:
+        p_sub = p if len(p) <= 256 else p[np.random.choice(len(p), 256, replace=False)]
+        tpl_part_trees.append(cKDTree(p_sub))
 
     best_R, best_cost = np.eye(3), np.inf
     for s1 in (1, -1):
@@ -1222,12 +1369,11 @@ def pca_vertical(obj_pts, tpl_pts):
             Mo = np.stack([u1, u2, np.cross(u1, u2)], axis=1)
             R = Mt @ Mo.T
 
-            # Rotate object and segment
-            rotated_obj = (R @ obj_pts.T).T
-            obj_parts = segment_semantic_parts(rotated_obj)
+            # Rotate precomputed object parts (graph decomposition is rotation-invariant)
+            rot_obj_parts = [(R @ part.T).T for part in obj_parts_base]
 
-            # Eq. 2: average per-part Chamfer distance
-            cost = match_parts_chamfer(tpl_parts, obj_parts)
+            # Eq. 2: average per-part Chamfer distance with precomputed template trees
+            cost = match_parts_chamfer(tpl_parts, rot_obj_parts, trees_a=tpl_part_trees)
             if cost < best_cost:
                 best_cost, best_R = cost, R.copy()
     return best_R
@@ -1237,22 +1383,28 @@ def pca_vertical(obj_pts, tpl_pts):
 # HORIZONTAL ALIGNMENT  (Paper §3.1, Equations 3-4)
 # =====================================================================
 
-def geometric_horizontal(obj_pts, tpl_pts, steps=None, tpl_tree=None):
+def geometric_horizontal(obj_pts, tpl_pts, steps=None, tpl_tree=None, tpl_sub=None):
     """Geometric horizontal alignment (Eq. 3) — fast version.
 
     Precomputes template KDTree once and reuses it across all theta steps.
-    Uses downsampled Chamfer (256 pts) for the search, then returns best theta.
+    Object points are subsampled ONCE outside the loop so all theta values
+    are scored on the same data (prevents argmin corruption from per-call noise).
     """
     if steps is None:
         steps = THETA_STEPS
     thetas = np.linspace(0, 2 * np.pi, steps, endpoint=False)
-    if len(tpl_pts) > 256:
-        tpl_sub = tpl_pts[np.random.choice(len(tpl_pts), 256, replace=False)]
-    else:
-        tpl_sub = tpl_pts
+
+    # Subsample template ONCE — accept a pre-built sub to stay consistent with caller's tree
+    if tpl_sub is None:
+        tpl_sub = tpl_pts if len(tpl_pts) <= 256 else tpl_pts[np.random.choice(len(tpl_pts), 256, replace=False)]
     if tpl_tree is None:
         tpl_tree = cKDTree(tpl_sub)
-    Eg = np.array([chamfer_distance_fast((rot_y(t) @ obj_pts.T).T, tpl_sub, tree_b=tpl_tree) for t in thetas])
+
+    # Subsample object ONCE so every theta is scored on the same 256-point set
+    obj_sub = obj_pts if len(obj_pts) <= 256 else obj_pts[np.random.choice(len(obj_pts), 256, replace=False)]
+
+    # Rotate the fixed subset in-place: obj_sub @ R.T  (avoids re-sampling per theta)
+    Eg = np.array([chamfer_distance_fast(obj_sub @ rot_y(t).T, tpl_sub, tree_b=tpl_tree) for t in thetas])
     return thetas[int(np.argmin(Eg))], thetas, Eg
 
 
@@ -1263,20 +1415,29 @@ def semantic_horizontal(obj_pts, tpl_pts, steps=None):
     - Template KDTree and template segments computed ONCE, reused for all angles.
     - Uses fast downsampled Chamfer (256 pts) for the inner loop.
     - Object parts are pre-computed once and only rotated per angle (no re-clustering).
+    - tpl_sub is passed to geometric_horizontal so the tree and the point set
+      are always from the same random draw (prevents silent data drift).
     """
     if steps is None:
         steps = THETA_STEPS
 
-    # Precompute template tree & segments (done ONCE)
+    # Precompute template sub-sample, tree & segments (done ONCE)
     tpl_sub = tpl_pts if len(tpl_pts) <= 256 else tpl_pts[np.random.choice(len(tpl_pts), 256, replace=False)]
     tpl_tree = cKDTree(tpl_sub)
-    theta_g, thetas, Eg = geometric_horizontal(obj_pts, tpl_pts, steps, tpl_tree=tpl_tree)
+    # Pass tpl_sub alongside tpl_tree so geometric_horizontal uses the same points
+    theta_g, thetas, Eg = geometric_horizontal(obj_pts, tpl_pts, steps, tpl_tree=tpl_tree, tpl_sub=tpl_sub)
 
-    # Find geometric extrema Ω (local minima of E_g)
+    # Find geometric local minima Ω.
+    # Use strict-less on the left side to avoid qualifying every point on flat plateaus.
+    # A plateau of equal values: leftmost point has Eg[i] < Eg[i-1]? No — so it's skipped.
+    # Only genuine descent→ascent transitions qualify.
     omega = []
     for i in range(len(Eg)):
-        if Eg[i] <= Eg[(i - 1) % len(Eg)] and Eg[i] <= Eg[(i + 1) % len(Eg)]:
-            omega.append(thetas[i])
+        if Eg[i] < Eg[(i - 1) % len(Eg)] and Eg[i] <= Eg[(i + 1) % len(Eg)]:
+            omega.append((thetas[i], Eg[i]))
+    # Prune to at most 4 best minima so the Gaussian prior stays informative
+    omega.sort(key=lambda x: x[1])
+    omega = [w for w, _ in omega[:4]]
     if not omega:
         omega = [theta_g]
 
@@ -1284,21 +1445,48 @@ def semantic_horizontal(obj_pts, tpl_pts, steps=None):
     tpl_parts = segment_semantic_parts(tpl_pts)
     obj_parts_base = segment_semantic_parts(obj_pts)
 
+    # Precompute template part KD-trees ONCE — template parts are fixed across all angles.
+    # This eliminates ~50% of KD-tree constructions in the inner loop.
+    tpl_part_trees = []
+    for p in tpl_parts:
+        p_sub = p if len(p) <= 256 else p[np.random.choice(len(p), 256, replace=False)]
+        tpl_part_trees.append(cKDTree(p_sub))
+
+    # Only evaluate Es near Ω neighborhoods (±2 steps around each geometric minimum).
+    # The Gaussian prior with σ=15° makes angles far from Ω irrelevant to the argmax,
+    # so evaluating all 36 angles wastes ~70% of the compute. Typically ~10-16 angles instead of 36.
+    sigma_g = np.radians(15.0)
+    step_size = thetas[1] - thetas[0] if len(thetas) > 1 else np.radians(10.0)
+    NEIGHBORHOOD = 2  # ±2 steps = ±20° around each minimum
+    eval_indices = set()
+    for w in omega:
+        # Find the closest theta index to this minimum
+        closest_idx = int(np.argmin(np.abs(thetas - w)))
+        for offset in range(-NEIGHBORHOOD, NEIGHBORHOOD + 1):
+            eval_indices.add(closest_idx + offset) # may go negative or > len(thetas), handled via %
+    eval_indices = sorted(set(i % len(thetas) for i in eval_indices))
+
+    # Compute Es only for the neighborhood indices
+    Es_local = np.array([
+        match_parts_chamfer(tpl_parts, [(rot_y(thetas[i]) @ part.T).T for part in obj_parts_base],
+                            trees_a=tpl_part_trees)
+        for i in eval_indices
+    ])
+    # Z-score normalize over the evaluated neighborhood
+    Es_mean = Es_local.mean()
+    Es_std  = Es_local.std() + 1e-8
+    Es_z_local = (Es_local - Es_mean) / Es_std
+
     best_theta, best_obj = theta_g, -np.inf
-    for t in thetas:
-        R = rot_y(t)
-        # Rotate each object part (preserves cluster assignments)
-        obj_parts_rotated = [(R @ part.T).T for part in obj_parts_base]
+    for local_i, global_i in enumerate(eval_indices):
+        t = thetas[global_i]
+        # Gaussian mixture over pruned Ω
+        ang_diffs = np.array([min(abs(t - w), 2 * np.pi - abs(t - w)) for w in omega])
+        log_gauss = np.log(np.sum(np.exp(-0.5 * (ang_diffs / sigma_g) ** 2)) + 1e-8)
 
-        # Semantic energy: average per-part fast Chamfer distance
-        Es = match_parts_chamfer(tpl_parts, obj_parts_rotated)
-
-        # Gaussian mixture centred at geometric extrema
-        gauss = sum(
-            np.exp(-0.5 * (min(abs(t - w), 2 * np.pi - abs(t - w))) ** 2)
-            for w in omega
-        )
-        objective = np.exp(-Es) * gauss
+        # Additive log-space: -Es_z maximised = low semantic cost; log_gauss = near a geo minimum.
+        LAMBDA = 1.0
+        objective = -Es_z_local[local_i] + LAMBDA * log_gauss
         if objective > best_obj:
             best_obj, best_theta = objective, t
     return best_theta
@@ -1360,14 +1548,19 @@ def passes_quality(mesh):
       - Fragmented mesh (too many disconnected components)
       - Degenerate faces (extreme area variance)
     """
-    # Basic geometry checks
-    if len(mesh.faces) == 0:
-        return True, "ok"
-    if len(mesh.faces) < MIN_FACES:
-        return False, "too few faces"
-    ext = mesh.bounding_box.extents
+    # 1. Vertex count check (valid for both meshes and point clouds)
+    if not hasattr(mesh, "vertices") or len(mesh.vertices) < min(MIN_FACES, 50):
+        return False, "too few vertices"
+
+    # 2. Thin-shell check on 3D extents (np.ptp works robustly for both meshes and point clouds)
+    ext = np.ptp(mesh.vertices, axis=0)
     if ext.max() <= 0 or (ext.min() / ext.max()) < MIN_THICKNESS_RATIO:
         return False, "thin-shell"
+
+    # 3. Face count check (for triangle meshes)
+    if hasattr(mesh, "faces") and len(mesh.faces) > 0:
+        if len(mesh.faces) < MIN_FACES:
+            return False, "too few faces"
 
     # Connected component check (catches fragmented / broken meshes)
     # NOTE: Disabled for GLB files. CAD models often have many disconnected parts
@@ -1405,44 +1598,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-def render_mesh_png(mesh, R, out_path):
-    """Render a mesh under rotation R and save to out_path as PNG."""
 
-    m = mesh.copy()
-    T = np.eye(4)
-    T[:3, :3] = R
-    m.apply_transform(T)
-
-    verts = m.vertices.copy()
-    verts = verts[:, [0, 2, 1]]
-    faces = m.faces
-    
-    fig = plt.figure(figsize=(RENDER_SIZE / 100, RENDER_SIZE / 100), dpi=100)
-    ax = fig.add_subplot(111, projection="3d")
-    
-    if len(faces) > 0:
-        tris = verts[faces]
-        light = np.array([0.3, 0.75, 0.6])
-        light = light / np.linalg.norm(light)
-        normals = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
-        nlen = np.linalg.norm(normals, axis=1, keepdims=True)
-        nlen[nlen == 0] = 1
-        normals = normals / nlen
-        shade = np.clip(np.abs(normals @ light), 0.0, 1.0) * 0.7 + 0.3
-        base = np.array([0.55, 0.60, 0.68])
-        facecolors = np.clip(shade[:, None] * base[None, :], 0, 1)
-        coll = Poly3DCollection(tris, facecolors=facecolors, edgecolors="none")
-        ax.add_collection3d(coll)
-    else:
-        ax.scatter(verts[:, 0], verts[:, 1], verts[:, 2], s=1, c='gray', depthshade=True)
-    lim = np.abs(verts).max() * 0.7
-    ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_zlim(-lim, lim)
-    ax.set_box_aspect((1, 1, 1))
-    ax.view_init(elev=18, azim=-55)
-    ax.set_axis_off()
-    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-    fig.savefig(out_path, transparent=False, facecolor="white")
-    plt.close(fig)
 
 
 class MeshRenderer:
@@ -1619,6 +1775,11 @@ def render_to_pil(mesh, R):
     """Render a mesh under rotation R directly to a PIL Image."""
     renderer = get_mesh_renderer()
     return renderer.render(mesh, R)
+
+def render_mesh_png(mesh, R, out_path):
+    """Render a mesh under rotation R and save to out_path as PNG using hardware MeshRenderer (Pyrender/Matplotlib)."""
+    img = render_to_pil(mesh, R)
+    img.save(out_path)
 
 
 # =====================================================================
@@ -1849,6 +2010,8 @@ class AgnosticRankingDataset(Dataset):
         candidates = []
         best_idxs = []
         category_idxs = []
+        candidate_rotations = []
+        r_rands = []
 
         for cat_data in all_category_data:
             category = cat_data["category"]
@@ -1871,6 +2034,11 @@ class AgnosticRankingDataset(Dataset):
                 best_idxs.append(obj["best_idx"])
                 category_idxs.append(cat_idx)
                 
+                # Candidate rotations (5, 3, 3) and input perturbation R_rand (3, 3)
+                c_rots = obj.get("candidate_rotations", [np.eye(3)] * 5)
+                candidate_rotations.append(torch.tensor(np.stack(c_rots), dtype=torch.float32))
+                r_rands.append(torch.tensor(obj.get("R_rand", np.eye(3)), dtype=torch.float32))
+                
         # By stacking these into monolithic PyTorch tensors instead of holding 
         # a list of Python dicts, we prevent DataLoader workers from deeply 
         # copying the entire dataset into RAM, which is the #1 cause of Kaggle OOMs.
@@ -1880,11 +2048,15 @@ class AgnosticRankingDataset(Dataset):
             self.candidates = torch.zeros((0, 5, N_POINTS, 3), dtype=torch.float32)
             self.best_idxs = torch.zeros((0,), dtype=torch.long)
             self.category_idxs = torch.zeros((0,), dtype=torch.long)
+            self.candidate_rotations = torch.zeros((0, 5, 3, 3), dtype=torch.float32)
+            self.r_rands = torch.zeros((0, 3, 3), dtype=torch.float32)
         else:
             self.templates = torch.stack(templates)
             self.candidates = torch.stack(candidates)
             self.best_idxs = torch.tensor(best_idxs, dtype=torch.long)
             self.category_idxs = torch.tensor(category_idxs, dtype=torch.long)
+            self.candidate_rotations = torch.stack(candidate_rotations)
+            self.r_rands = torch.stack(r_rands)
 
     def __len__(self):
         return len(self.best_idxs) * self.n_rotations
@@ -1896,17 +2068,47 @@ class AgnosticRankingDataset(Dataset):
         candidates = self.candidates[item_idx].clone()
         best_idx = self.best_idxs[item_idx]
         category_idx = self.category_idxs[item_idx]
+        cand_rots = self.candidate_rotations[item_idx].clone()
+        r_rand = self.r_rands[item_idx].clone()
 
         if self.augment and self.n_rotations > 1:
             R = random_rotation_matrix_torch()
             template = template @ R.T
             candidates = candidates @ R.T  # (5, N, 3) @ (3, 3) broadcasts correctly
+            r_rand = R @ r_rand
+
+        if self.augment:
+            # --- Point-cloud augmentations that break exact equivariance ---
+            # (SO(3) rotation alone is absorbed by VNN architecture and does NOT regularise)
+            N = template.shape[0]
+
+            # 1. Gaussian jitter: σ ≈ 0.005–0.01 of unit radius.
+            #    Breaks exact equivariance, mimics sensor noise / surface uncertainty.
+            sigma = 0.007
+            template  = template  + sigma * torch.randn_like(template)
+            candidates = candidates + sigma * torch.randn(candidates.shape[0], N, 3)
+
+            # 2. Random point dropout → resample a fresh 1024-subset.
+            #    Free (randperm), teaches robustness to partial scans / varying mesh density.
+            perm_t = torch.randperm(N)
+            template = template[perm_t]
+            perm_c = torch.randperm(N)
+            candidates = candidates[:, perm_c, :]  # (5, N, 3) — same permutation across candidates keeps label valid
+
+            # 3. Global scale jitter: uniform in [0.95, 1.05].
+            #    Breaks scale equivariance, regularises against normalisation residuals.
+            #    Applied identically to template AND candidates so Chamfer pseudo-label remains valid.
+            scale = 0.95 + 0.10 * torch.rand(1).item()
+            template  = template  * scale
+            candidates = candidates * scale
 
         return {
             "template_pts": template,
             "candidate_pts": candidates,
             "best_idx": best_idx,
             "category_idx": category_idx,
+            "candidate_rotations": cand_rots,
+            "R_rand": r_rand,
         }
 
 
@@ -1921,7 +2123,7 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
     cache_file = get_cache_file(category)
 
     if not force_rebuild and os.path.exists(cache_file):
-        print(f"\n  Loading cached data from {cache_file}...")
+        print(f"  Loading cached data from {cache_file}...")
         try:
             return torch.load(cache_file, weights_only=False)
         except (RuntimeError, EOFError, Exception) as e:
@@ -1957,9 +2159,13 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
     for uid in medoid_uids:
         tpl_path = objs.get(uid)
         if tpl_path is None: continue
-        m = normalize_to_unit_sphere(load_mesh_or_pc(tpl_path))
-        pts = sample_points(m, seed=42, with_normals=False)
-        medoid_pts_list.append((uid, pts))
+        try:
+            m = normalize_to_unit_sphere(load_mesh_or_pc(tpl_path))
+            pts = sample_points(m, seed=42, with_normals=False)
+            medoid_pts_list.append((uid, pts))
+        except Exception as e:
+            print(f"  [!] Could not load template candidate '{os.path.basename(tpl_path)}' ({type(e).__name__}: {e}).")
+            continue
         
     # GPU-accelerated pairwise medoid selection (OOM-safe: only 1 pair in VRAM at a time < 1MB)
     if len(medoid_pts_list) > 1:
@@ -2026,26 +2232,23 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
             continue
         try:
             mesh = normalize_to_unit_sphere(load_mesh_or_pc(path))
-        except Exception:
+        except Exception as e:
+            print(f"  [!] Failed to load mesh '{os.path.basename(path)}' ({type(e).__name__}: {e}). Skipping.")
             continue
         ok, reason = passes_quality(mesh)
         if not ok:
             discarded += 1
             continue
 
-        # CRITICAL FIX: Randomly rotate the mesh to simulate real-world unaligned input!
-        # If we don't do this, the network just learns to pick the identity rotation
-        # because ModelNet40/CanoVerse files are often already pre-aligned.
-        
-        # NOTE: Trimesh's apply_transform() clears the geometry cache. For face-stripped 
-        # point clouds (our >50K capped GLBs), this permanently destroys our custom 
-        # vertex_normals! We must save, rotate, and restore them manually.
+        # Rotate the mesh using realistic orientation distribution:
+        # Prevents 100% SO(3) rotation from destroying horizontal candidates (0, 1, 2)
+        # while still simulating unaligned input (60% yaw, 20% tilt, 20% full SO(3)).
         has_custom_normals = hasattr(mesh, 'vertex_normals') and len(mesh.vertex_normals) > 0
         if has_custom_normals:
             saved_normals = mesh.vertex_normals.copy()
             
         T_rand = np.eye(4)
-        R_rand = random_rotation_matrix()
+        R_rand = random_realistic_input_rotation()
         T_rand[:3, :3] = R_rand
         mesh.apply_transform(T_rand)
         
@@ -2078,6 +2281,7 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
             "candidate_names": cand_name_list,
             "best_idx": best_idx,
             "chamfer_distances": cd_dists,
+            "R_rand": R_rand,
         })
     print(f"\r  Processing [{category}]: Completed {len(data_objects)} objects ({discarded} discarded).        ")
 
@@ -2119,11 +2323,12 @@ def prepare_training_data(category, n_objects=None, force_rebuild=False):
 # =====================================================================
 
 def train_one_epoch_ranking(model, dataloader, optimizer, device, epoch,
-                             use_category=False):
-    """Train one epoch with ranking loss (5-way cross-entropy over candidates)."""
+                             use_category=False, scaler=None):
+    """Train one epoch with ranking loss (5-way cross-entropy over candidates) using AMP."""
     model.train()
     total_loss = 0.0
     correct, total = 0, 0
+    use_amp = (device.type == "cuda")
     
     optimizer.zero_grad()
     for batch_idx, batch in enumerate(dataloader):
@@ -2132,16 +2337,22 @@ def train_one_epoch_ranking(model, dataloader, optimizer, device, epoch,
         best_idx = batch["best_idx"].to(device)           # (B,)
         cat_idx = batch["category_idx"].to(device) if use_category else None
 
-        # Vectorized: encode template ONCE + all 5 candidates ONCE = 2 encoder passes total
-        logits = model.forward_all_candidates(template, candidates, category_idx=cat_idx)  # (B, 5)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            logits = model.forward_all_candidates(template, candidates, category_idx=cat_idx)  # (B, 5)
+            loss = F.cross_entropy(logits, best_idx, label_smoothing=0.05)
+            scaled_loss = loss / GRAD_ACCUM_STEPS
 
-        loss = F.cross_entropy(logits, best_idx, label_smoothing=0.05)
-
-        scaled_loss = loss / GRAD_ACCUM_STEPS
-        scaled_loss.backward()
+        if scaler is not None and use_amp:
+            scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
 
         if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0:
-            optimizer.step()
+            if scaler is not None and use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
             optimizer.zero_grad()
 
         preds = logits.argmax(dim=1)
@@ -2150,7 +2361,11 @@ def train_one_epoch_ranking(model, dataloader, optimizer, device, epoch,
         total_loss += loss.item() * batch["template_pts"].shape[0]
 
     if len(dataloader) % GRAD_ACCUM_STEPS != 0:
-        optimizer.step()
+        if scaler is not None and use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         optimizer.zero_grad()
 
     return {"loss": total_loss / total if total else 0, "selection_accuracy": correct / total if total else 0}
@@ -2158,11 +2373,13 @@ def train_one_epoch_ranking(model, dataloader, optimizer, device, epoch,
 
 @torch.no_grad()
 def evaluate_ranking(model, dataloader, device, phase="VAL", use_category=False):
-    """Evaluate with ranking loss — reports selection accuracy."""
+    """Evaluate with ranking loss — reports selection accuracy and true geodesic rotation metrics."""
     model.eval()
     total_loss = 0.0
     correct, total = 0, 0
     all_preds, all_labels = [], []
+    geodesic_errors = []
+
     for batch in dataloader:
         template = batch["template_pts"].to(device)
         candidates = batch["candidate_pts"].to(device)
@@ -2182,7 +2399,20 @@ def evaluate_ranking(model, dataloader, device, phase="VAL", use_category=False)
         all_preds.extend(preds.cpu().tolist())
         all_labels.extend(best_idx.cpu().tolist())
 
-    return {
+        # Ground truth geodesic rotation evaluation (against Identity)
+        if "candidate_rotations" in batch and "R_rand" in batch:
+            cand_rots = batch["candidate_rotations"].cpu().numpy()  # (B, 5, 3, 3)
+            r_rands = batch["R_rand"].cpu().numpy()                # (B, 3, 3)
+            preds_np = preds.cpu().numpy()                         # (B,)
+            for b in range(len(preds_np)):
+                pred_cand_R = cand_rots[b, preds_np[b]]            # (3, 3)
+                R_rand_b = r_rands[b]                              # (3, 3)
+                # Maps canonical shape -> predicted canonical pose
+                R_pred_canonical = pred_cand_R @ R_rand_b
+                err = geodesic_angle_deg(R_pred_canonical, np.eye(3))
+                geodesic_errors.append(err)
+
+    results = {
         "loss": total_loss / total if total else 0,
         "selection_accuracy": correct / total if total else 0,
         "selection_correct": correct,
@@ -2191,31 +2421,40 @@ def evaluate_ranking(model, dataloader, device, phase="VAL", use_category=False)
         "labels": all_labels,
     }
 
+    if geodesic_errors:
+        errs = np.array(geodesic_errors)
+        results["acc_at_10"] = float((errs <= 10.0).mean())
+        results["acc_at_30"] = float((errs <= 30.0).mean())
+        results["mean_geodesic_error"] = float(np.mean(errs))
+        results["median_geodesic_error"] = float(np.median(errs))
+
+    return results
+
 
 # =====================================================================
 # GEODESIC EVALUATION METRICS  (Paper §4 — Acc@10, Acc@30)
 # =====================================================================
 
-# def compute_geodesic_metrics(predicted_rotations, gt_rotations):
-#     """Compute geodesic error metrics between predicted and ground-truth rotations.
+def compute_geodesic_metrics(predicted_rotations, gt_rotations):
+    """Compute geodesic error metrics between predicted and ground-truth rotations.
 
-#     Returns:
-#         dict with acc_at_10, acc_at_30, median_error_deg, mean_error_deg
-#     """
-#     errors = []
-#     for R_pred, R_gt in zip(predicted_rotations, gt_rotations):
-#         errors.append(geodesic_angle_deg(
-#             np.asarray(R_pred, dtype=np.float64),
-#             np.asarray(R_gt, dtype=np.float64),
-#         ))
-#     errors = np.array(errors)
-#     return {
-#         "acc_at_10": float((errors <= 10).mean()) if len(errors) else 0.0,
-#         "acc_at_30": float((errors <= 30).mean()) if len(errors) else 0.0,
-#         "median_error_deg": float(np.median(errors)) if len(errors) else 0.0,
-#         "mean_error_deg": float(np.mean(errors)) if len(errors) else 0.0,
-#         "n_samples": len(errors),
-#     }
+    Returns:
+        dict with acc_at_10, acc_at_30, median_error_deg, mean_error_deg
+    """
+    errors = []
+    for R_pred, R_gt in zip(predicted_rotations, gt_rotations):
+        errors.append(geodesic_angle_deg(
+            np.asarray(R_pred, dtype=np.float64),
+            np.asarray(R_gt, dtype=np.float64),
+        ))
+    errors = np.array(errors)
+    return {
+        "acc_at_10": float((errors <= 10).mean()) if len(errors) else 0.0,
+        "acc_at_30": float((errors <= 30).mean()) if len(errors) else 0.0,
+        "median_error_deg": float(np.median(errors)) if len(errors) else 0.0,
+        "mean_error_deg": float(np.mean(errors)) if len(errors) else 0.0,
+        "n_samples": len(errors),
+    }
 
 
 # =====================================================================
@@ -2329,18 +2568,13 @@ def train_agnostic(categories=None):
     print(f"  Total test samples:  {len(test_ds)}")
     print(f"  Category count:      {n_cats}")
 
-    num_workers = 2 if (os.name != 'nt' and torch.cuda.is_available()) else 0
-    use_persistent = (num_workers > 0)
-
+    # In-memory tensor dataset: num_workers=0 eliminates multiprocessing IPC overhead and /dev/shm OOM risks
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=num_workers, pin_memory=(device.type == "cuda"),
-                              persistent_workers=use_persistent)
+                              num_workers=0, pin_memory=(device.type == "cuda"))
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE * 2, shuffle=False,
-                            num_workers=num_workers, pin_memory=(device.type == "cuda"),
-                            persistent_workers=use_persistent)
+                            num_workers=0, pin_memory=(device.type == "cuda"))
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE * 2, shuffle=False,
-                             num_workers=num_workers, pin_memory=(device.type == "cuda"),
-                             persistent_workers=use_persistent)
+                             num_workers=0, pin_memory=(device.type == "cuda"))
 
     # ---- Build model ----
     model = VNCandidateSelector(
@@ -2352,7 +2586,7 @@ def train_agnostic(categories=None):
     ).to(device)
     print(f"\n{model_summary(model)}")
 
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
 
     agnostic_path = get_agnostic_model_path()
@@ -2382,6 +2616,7 @@ def train_agnostic(categories=None):
     print("  [INFO] Download Location: Kaggle Right Panel -> Output -> checkpoints/")
     print("  [INFO] Advantage: Auto-saves every epoch so you can resume training seamlessly after any crash without losing progress.")
 
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
     train_start = time.time()
 
     if start_epoch <= NUM_EPOCHS:
@@ -2389,7 +2624,7 @@ def train_agnostic(categories=None):
         for epoch in epoch_pbar:
             t0 = time.time()
             tm = train_one_epoch_ranking(model, train_loader, optimizer, device, epoch,
-                                         use_category=True)
+                                         use_category=True, scaler=scaler)
             vm = evaluate_ranking(model, val_loader, device, "VAL", use_category=True)
             scheduler.step(vm["selection_accuracy"])
             et = time.time() - t0
@@ -2467,6 +2702,11 @@ def train_agnostic(categories=None):
     print(f"\n  Test Results:")
     print(f"    Selection Accuracy: {test_m['selection_accuracy']:.3f} "
           f"({test_m['selection_correct']}/{test_m['selection_total']})")
+    if "acc_at_10" in test_m:
+        print(f"    Acc@10° (Geodesic): {test_m['acc_at_10']*100:.1f}%")
+        print(f"    Acc@30° (Geodesic): {test_m['acc_at_30']*100:.1f}%")
+        print(f"    Mean Geodesic Err:  {test_m['mean_geodesic_error']:.2f}°")
+        print(f"    Median Geodesic Err:{test_m['median_geodesic_error']:.2f}°")
     print(f"    Loss:               {test_m['loss']:.4f}")
 
     # ---- Per-category breakdown ----
@@ -2478,8 +2718,9 @@ def train_agnostic(categories=None):
             continue
         cat_loader = DataLoader(cat_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
         cat_m = evaluate_ranking(model, cat_loader, device, cat.upper(), use_category=True)
+        acc10_str = f"| Acc@10: {cat_m['acc_at_10']*100:.1f}%" if "acc_at_10" in cat_m else ""
         print(f"    {cat:12s}: SelAcc {cat_m['selection_accuracy']:.3f} "
-              f"({cat_m['selection_correct']}/{cat_m['selection_total']})")
+              f"({cat_m['selection_correct']}/{cat_m['selection_total']}) {acc10_str}")
 
     total_time = time.time() - total_start
     print(f"\n{'='*60}")
@@ -2536,17 +2777,32 @@ def generate_category(category):
     else:
         print(f"  [!] No VNN checkpoint found at {agnostic_path}. Generating without auto-selection.")
 
-    # Template
-    template_uid = uids[0]
-    objs = download_objects([template_uid])
-    tpl_path = objs.get(template_uid)
-    if tpl_path is None:
-        print(f"  [!] Template resolution failed. Skipping.")
-        return 0, 0
-    tpl_mesh = normalize_to_unit_sphere(load_mesh_or_pc(tpl_path))
-    tpl_pts = sample_points(tpl_mesh)
-    render_mesh_png(tpl_mesh, np.eye(3), os.path.join(out_dir, "template.png"))
-    print(f"  Template = {template_uid}")
+    # Template: Use the cached medoid template from training if available,
+    # so the model evaluates candidates against the exact reference frame it was trained on.
+    objs = download_objects(uids)
+    cache_file = get_cache_file(category)
+    if os.path.exists(cache_file):
+        data = torch.load(cache_file, weights_only=False)
+        tpl_pts = data["template_pts"]
+        template_uid = data.get("template_uid", uids[0])
+        tpl_path = objs.get(template_uid) or download_objects([template_uid]).get(template_uid)
+        if tpl_path:
+            try:
+                tpl_mesh = normalize_to_unit_sphere(load_mesh_or_pc(tpl_path))
+                render_mesh_png(tpl_mesh, np.eye(3), os.path.join(out_dir, "template.png"))
+            except Exception:
+                pass
+        print(f"  Template = {template_uid} (loaded from cached medoid)")
+    else:
+        template_uid = uids[0]
+        tpl_path = objs.get(template_uid)
+        if tpl_path is None:
+            print(f"  [!] Template resolution failed. Skipping.")
+            return 0, 0
+        tpl_mesh = normalize_to_unit_sphere(load_mesh_or_pc(tpl_path))
+        tpl_pts = sample_points(tpl_mesh)
+        render_mesh_png(tpl_mesh, np.eye(3), os.path.join(out_dir, "template.png"))
+        print(f"  Template = {template_uid} (random fallback)")
 
     manifest = {"category": category, "template": "template.png",
                 "vnn_enabled": vnn_available, "objects": []}
@@ -2560,7 +2816,8 @@ def generate_category(category):
             continue
         try:
             mesh = normalize_to_unit_sphere(load_mesh_or_pc(path))
-        except Exception:
+        except Exception as e:
+            print(f"  [!] Failed to load mesh '{os.path.basename(path)}' ({type(e).__name__}: {e}). Skipping.")
             continue
         ok, _ = passes_quality(mesh)
         if not ok:
@@ -2584,16 +2841,14 @@ def generate_category(category):
         vnn_selection = None
         if vnn_available:
             obj_pts = sample_points(mesh)
-            tpl_tensor = torch.tensor(tpl_pts, dtype=torch.float32).unsqueeze(0).to(device)
+            tpl_tensor = torch.tensor(tpl_pts, dtype=torch.float32).unsqueeze(0).to(device) # (1, N, 3)
             cat_tensor = (torch.tensor([vnn_cat_idx], dtype=torch.long).to(device)
                           if vnn_cat_idx is not None else None)
-            scores = []
+            cand_pts_list = [(R @ obj_pts.T).T for R in cand_rotations]
+            cand_tensor = torch.tensor(np.stack(cand_pts_list), dtype=torch.float32).unsqueeze(0).to(device) # (1, 5, N, 3)
             with torch.no_grad():
-                for R in cand_rotations:
-                    rotated = (R @ obj_pts.T).T
-                    ct = torch.tensor(rotated, dtype=torch.float32).unsqueeze(0).to(device)
-                    s = vnn_model_obj(tpl_tensor, ct, category_idx=cat_tensor)
-                    scores.append(s.item())
+                logits = vnn_model_obj.forward_all_candidates(tpl_tensor, cand_tensor, category_idx=cat_tensor)
+                scores = logits.squeeze(0).cpu().tolist()
             best_idx = int(np.argmax(scores))
 
             correct_dir = os.path.join(obj_dir, "correct")
@@ -2701,13 +2956,11 @@ def align_single_object(mesh_or_path, template_mesh_or_pts=None, category=None):
 
     if model_loaded:
         tpl_tensor = torch.tensor(template_pts, dtype=torch.float32).unsqueeze(0).to(device)
-        scores = []
+        cand_pts_list = [(R @ obj_pts.T).T for _, R in candidates]
+        cand_tensor = torch.tensor(np.stack(cand_pts_list), dtype=torch.float32).unsqueeze(0).to(device) # (1, 5, N, 3)
         with torch.no_grad():
-            for name, R in candidates:
-                rotated = (R @ obj_pts.T).T
-                ct = torch.tensor(rotated, dtype=torch.float32).unsqueeze(0).to(device)
-                s = model(tpl_tensor, ct, category_idx=cat_idx_tensor)
-                scores.append(s.item())
+            logits = model.forward_all_candidates(tpl_tensor, cand_tensor, category_idx=cat_idx_tensor)
+            scores = logits.squeeze(0).cpu().tolist()
         best_idx = int(np.argmax(scores))
         print(f"  VNN scores: {[f'{s:.3f}' for s in scores]}")
     else:
@@ -2760,7 +3013,8 @@ def evaluate_stability_consistency(category, num_objects=10, k_rotations=5):
                 valid_objects.append(mesh)
             if len(valid_objects) >= num_objects:
                 break
-        except Exception:
+        except Exception as e:
+            print(f"  [!] Failed to load mesh '{os.path.basename(path)}' for evaluation ({type(e).__name__}: {e}). Skipping.")
             continue
             
     if len(valid_objects) < 2:
@@ -2795,16 +3049,17 @@ def evaluate_stability_consistency(category, num_objects=10, k_rotations=5):
     cat_tensor = torch.tensor([vnn_cat_idx], dtype=torch.long).to(device) if vnn_cat_idx is not None else None
 
     def get_predicted_rotation(mesh_input, R_rand):
-        # We manually rotate points and normals to be safe instead of using mesh.apply_transform
-        # because Trimesh apply_transform might drop or incorrectly transform custom vertex_normals.
-        pts, norms = sample_points(mesh_input, with_normals=True)
-        pts_rot = (R_rand @ pts.T).T
-        norms_rot = (R_rand @ norms.T).T
-        
-        rot_mesh = trimesh.Trimesh(vertices=pts_rot)
-        rot_mesh.vertex_normals = norms_rot
+        # Apply transformation to the actual mesh copy so that generate_five_candidates
+        # has access to the full mesh geometry for support_vertical, convex hull, and PCA.
+        rot_mesh = mesh_input.copy()
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = R_rand
+        rot_mesh.apply_transform(T)
+        if hasattr(mesh_input, 'vertex_normals') and len(mesh_input.vertex_normals) > 0:
+            rot_mesh.vertex_normals = (R_rand @ mesh_input.vertex_normals.T).T
         
         candidates = generate_five_candidates(rot_mesh, template_pts, category=category)
+        pts_rot = sample_points(rot_mesh, seed=42)
         
         scores = []
         cand_R = []
@@ -2847,9 +3102,18 @@ def evaluate_stability_consistency(category, num_objects=10, k_rotations=5):
                 
     avg_consistency = rms_cons_deg
 
+    # Ground-truth canonical accuracy (since CanoVerse is canonicalized, ideal is Identity)
+    abs_errors = [geodesic_angle_deg(R, np.eye(3)) for R in canonical_rotations_per_object]
+    acc_10 = float(np.mean([e <= 10.0 for e in abs_errors]) * 100.0) if abs_errors else 0.0
+    acc_30 = float(np.mean([e <= 30.0 for e in abs_errors]) * 100.0) if abs_errors else 0.0
+    mean_abs_err = float(np.mean(abs_errors)) if abs_errors else 0.0
+
     print(f"\n  [RESULTS] Category: {category.upper()}")
-    print(f"    Stability (k={k_rotations}):   {avg_stability:.2f}° (Ideal: 0°)")
-    print(f"    Consistency (n={len(valid_objects)}): {avg_consistency:.2f}° (Ideal: 0°)\n")
+    print(f"    Stability (k={k_rotations}):          {avg_stability:.2f}° (Spread vs self mean, Ideal: 0°)")
+    print(f"    Consistency (n={len(valid_objects)}):        {avg_consistency:.2f}° (Spread vs category mean, Ideal: 0°)")
+    print(f"    Ground-Truth Acc@10°:       {acc_10:.1f}%")
+    print(f"    Ground-Truth Acc@30°:       {acc_30:.1f}%")
+    print(f"    Mean Geodesic Error vs GT:  {mean_abs_err:.2f}°\n")
     
     return avg_stability, avg_consistency
 
@@ -2910,6 +3174,7 @@ def run_agnostic(categories=None):
     print("\n" + "#" * 60)
     print("  FULL PIPELINE: AGNOSTIC TRAIN + GENERATE + EVALUATE")
     # print(f"  Categories: {', '.join(categories)}")
+    if MAX_CATEGORIES is not None: print(f"  Max categories: {MAX_CATEGORIES} (Processing {len(categories)} categories)")
     if USE_ONLY_N_SAMPLES: print(f"  Samples per category: {N_SAMPLES}")
     print(f"  Rotation augmentation: {N_ROTATIONS}x")
     print("#" * 60)
